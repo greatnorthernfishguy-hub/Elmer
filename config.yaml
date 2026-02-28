@@ -1,29 +1,29 @@
-# Elmer Configuration — Phase 1 (Foundation v0.1)
+# Elmer Configuration  (PRD §6, §7, §14)
 #
 # All values have sensible defaults. Override only what you need.
 # Environment variables: use ${VAR_NAME} syntax for interpolation.
 
 module_id: elmer
 display_name: Elmer
-version: "0.1.0"
+version: "0.2.0"
 log_level: INFO
 data_dir: "~/.elmer"
 
-# Hardware detection and allocation
+# Hardware detection and allocation  (PRD §5.2)
 hardware:
   prefer_gpu: true
   gpu_memory_fraction: 0.5
   cpu_threads: 0          # 0 = auto-detect
   enable_npu: false
 
-# Socket manager
+# Socket manager  (PRD §5.2)
 sockets:
   max_sockets: 16
   health_check_interval: 30.0
   connect_timeout: 10.0
   default_priority: 5
 
-# NG ecosystem (learning substrate)
+# NG ecosystem (learning substrate)  (PRD §7)
 ng_ecosystem:
   module_id: elmer
   state_path: ""          # Empty = default (~/.et_modules/elmer/ng_lite_state.json)
@@ -32,10 +32,23 @@ ng_ecosystem:
   tier3_upgrade_enabled: true
   tier3_poll_interval: 300.0
 
-# Processing pipelines
+# Processing pipelines  (PRD §8)
 pipelines:
   sensory_enabled: true
   inference_enabled: true
   health_enabled: true
   memory_enabled: true
   identity_enabled: true
+
+# Autonomic integration  (PRD §7)
+# Elmer reads but NEVER writes autonomic state.
+# State file: ~/.et_modules/autonomic_state.json
+autonomic:
+  enabled: true
+  cache_ttl: 5.0          # seconds between re-reads
+
+# Coherence thresholds  (PRD §14)
+# Defined as constants in ng_ecosystem.py:
+#   COHERENCE_HEALTHY  = 0.70
+#   COHERENCE_DEGRADED = 0.40
+#   COHERENCE_CRITICAL = 0.15

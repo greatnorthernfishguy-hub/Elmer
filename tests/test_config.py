@@ -19,7 +19,7 @@ class TestElmerConfig:
     def test_defaults(self):
         cfg = ElmerConfig()
         assert cfg.module_id == "elmer"
-        assert cfg.version == "0.1.0"
+        assert cfg.version == "0.2.0"
         assert cfg.log_level == "INFO"
 
     def test_hardware_defaults(self):
@@ -56,7 +56,7 @@ class TestLoadConfig:
     def test_load_from_project_config(self):
         cfg = load_config()
         assert cfg.module_id == "elmer"
-        assert cfg.version == "0.1.0"
+        assert cfg.version == "0.2.0"
 
     def test_load_custom_yaml(self):
         try:

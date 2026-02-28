@@ -1,14 +1,12 @@
 """
-Health Pipeline — System Health Monitoring Chain
+Health Pipeline — System Health Monitoring Chain  (PRD §8)
 
-Processes health-related signals: socket status, resource usage,
-degradation alerts, and recovery actions.
-
-Phase 1: Stub that aggregates basic health from socket manager.
-Phase 2+: Anomaly detection, predictive health, auto-recovery.
+Generates and processes health signals using §14 threshold constants.
 
 # ---- Changelog ----
-# [2026-02-28] Claude (Opus 4.6) — Phase 1 stub.
+# [2026-02-28] Claude (Opus 4.6) — §6.1/§8/§14 compliant rewrite.
+#   What: HealthPipeline producing §6.1 health signals with §14 thresholds.
+#   Why:  PRD v0.2.0 mandates coherence-aware health monitoring.
 # -------------------
 """
 
@@ -18,7 +16,12 @@ import logging
 import time
 from typing import Any, Dict
 
-from ng_ecosystem import SubstrateSignal, SignalType
+from ng_ecosystem import (
+    COHERENCE_CRITICAL,
+    COHERENCE_DEGRADED,
+    COHERENCE_HEALTHY,
+    SubstrateSignal,
+)
 
 logger = logging.getLogger("elmer.pipeline.health")
 
@@ -26,48 +29,70 @@ logger = logging.getLogger("elmer.pipeline.health")
 class HealthPipeline:
     """System health monitoring pipeline.
 
-    Phase 1: Basic health signal generation.
-    Phase 2+: Anomaly detection, predictive health, auto-recovery.
+    Generates health signals and scores them against §14 thresholds.
+
+    Ref: PRD §8, §14
     """
 
     def __init__(self) -> None:
         self._check_count = 0
         self._start_time = time.time()
 
-    def check(self) -> SubstrateSignal:
+    def check(self, coherence: float = 1.0) -> SubstrateSignal:
         """Generate a health check signal.
 
+        Args:
+            coherence: Current coherence score for threshold evaluation.
+
         Returns:
-            HEALTH SubstrateSignal with current system status.
+            §6.1 SubstrateSignal of type "health".
         """
         self._check_count += 1
+        uptime = time.time() - self._start_time
+
+        # Severity from §14 thresholds
+        if coherence >= COHERENCE_HEALTHY:
+            severity = 0.0
+        elif coherence >= COHERENCE_DEGRADED:
+            severity = 0.3
+        elif coherence >= COHERENCE_CRITICAL:
+            severity = 0.7
+        else:
+            severity = 1.0
 
         return SubstrateSignal.create(
-            source_socket="pipeline:health",
-            signal_type=SignalType.HEALTH,
-            payload={
-                "status": "healthy",
-                "uptime": time.time() - self._start_time,
-                "check_count": self._check_count,
-            },
+            signal_type="health",
+            description=f"Health check #{self._check_count}: coherence={coherence:.2f}",
+            coherence_score=coherence,
+            health_score=coherence,
+            anomaly_level=0.0,
+            novelty=0.0,
             confidence=1.0,
-            priority=3,
-            metadata={"pipeline": "health", "version": "0.1.0"},
+            severity=severity,
+            temporal_window=uptime,
+            metadata={
+                "pipeline": "health",
+                "check_count": self._check_count,
+                "uptime": uptime,
+            },
         )
 
     def process(self, signal: SubstrateSignal) -> SubstrateSignal:
-        """Process a health-related signal.
+        """Process a health-related signal through §14 threshold checks.
 
         Args:
-            signal: Health signal to process.
+            signal: Health signal to evaluate.
 
         Returns:
-            Enriched HEALTH SubstrateSignal.
+            Enriched health SubstrateSignal.
         """
         self._check_count += 1
         return signal.with_updates(
-            source_socket="pipeline:health",
-            metadata={**signal.metadata, "health_processed": True},
+            metadata={
+                **signal.metadata,
+                "health_processed": True,
+                "coherence_status": signal.coherence_status,
+            },
         )
 
     def stats(self) -> Dict[str, Any]:

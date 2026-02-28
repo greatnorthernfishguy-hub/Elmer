@@ -1,5 +1,5 @@
 """
-Elmer OpenClaw Hook — Substrate Processing Skill Adapter
+Elmer OpenClaw Hook — Substrate Processing Skill Adapter  (PRD §7, §9)
 
 Subclasses OpenClawAdapter to integrate Elmer's cognitive substrate
 into the OpenClaw AI assistant framework.  This is the entry point
@@ -7,21 +7,24 @@ that OpenClaw discovers and calls.
 
 on_message():
     Raw text → SensoryPipeline → ComprehensionSocket → InferencePipeline
-    → NG ecosystem learning → enriched context response.
+    → Memory store → NG ecosystem learning → enriched context response.
+    Autonomic state (§7) modulates processing priority and pruning.
 
 get_context():
-    Query text → NG ecosystem context retrieval → cross-module
-    recommendations → enriched context for prompt injection.
+    Query text → NG ecosystem context → memory recall → identity
+    → cross-module recommendations.
 
-stats():
-    Full telemetry from engine, sockets, pipelines, and ecosystem.
+stats() / health():
+    Full telemetry from engine, sockets, pipelines, ecosystem,
+    and autonomic state.
 
 # ---- Changelog ----
-# [2026-02-28] Claude (Opus 4.6) — Phase 1 initial creation.
-#   What: ElmerHook subclassing OpenClawAdapter with ElmerEngine
-#         integration, pipeline routing, and health endpoint.
-#   Why:  Standard OpenClaw skill interface for the Elmer substrate.
-#         Enables "just works" integration — install and go.
+# [2026-02-28] Claude (Opus 4.6) — §6.1/§7/§9 compliant rewrite.
+#   What: ElmerHook with §6.1 SubstrateSignal format, §7 autonomic
+#         awareness (read-only), full pipeline chaining, and §14
+#         threshold-aware health reporting.
+#   Why:  PRD v0.2.0 §7 mandates autonomic integration; §6.1 mandates
+#         flat scored signal fields; §9 mandates full pipeline chain.
 # -------------------
 """
 
@@ -33,14 +36,16 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from openclaw_adapter import OpenClawAdapter
-from runtime.engine import ElmerEngine
 from core.config import ElmerConfig, load_config
-from pipelines.sensory import SensoryPipeline
-from pipelines.inference import InferencePipeline
+from ng_autonomic import AutonomicMonitor, AutonomicState
+from ng_ecosystem import COHERENCE_HEALTHY, SubstrateSignal
+from openclaw_adapter import OpenClawAdapter
 from pipelines.health import HealthPipeline
-from pipelines.memory import MemoryPipeline
 from pipelines.identity import IdentityPipeline
+from pipelines.inference import InferencePipeline
+from pipelines.memory import MemoryPipeline
+from pipelines.sensory import SensoryPipeline
+from runtime.engine import ElmerEngine
 
 logger = logging.getLogger("elmer.hook")
 
@@ -48,20 +53,13 @@ logger = logging.getLogger("elmer.hook")
 class ElmerHook(OpenClawAdapter):
     """OpenClaw skill hook for the Elmer cognitive substrate.
 
-    Extends OpenClawAdapter with Elmer-specific processing:
-      - Full pipeline routing (sensory → inference → memory)
-      - Engine lifecycle management
-      - Health monitoring via MonitoringSocket
-      - Identity consistency via IdentityPipeline
+    Extends OpenClawAdapter with:
+      - §6.1 SubstrateSignal format (flat scored fields)
+      - §7 Autonomic modulation (read-only)
+      - §8 Full pipeline chaining (sensory → inference → memory → identity)
+      - §14 Threshold-aware health reporting
 
-    Usage (OpenClaw auto-discovery via et_module.json entry_point):
-        from elmer_hook import ElmerHook
-
-        hook = ElmerHook()
-        result = hook.on_message("What patterns have you observed?")
-        context = hook.get_context("Tell me about X")
-        health = hook.health()
-        print(hook.stats())
+    Ref: PRD §7, §9
     """
 
     _instance: Optional["ElmerHook"] = None
@@ -89,10 +87,10 @@ class ElmerHook(OpenClawAdapter):
             },
         )
 
-        # Initialize engine
         self._engine = ElmerEngine(config=self._elmer_config)
+        self._autonomic = AutonomicMonitor()
 
-        # Initialize pipelines
+        # Pipelines  (PRD §8)
         self._sensory = SensoryPipeline()
         self._inference = InferencePipeline()
         self._health = HealthPipeline()
@@ -106,18 +104,13 @@ class ElmerHook(OpenClawAdapter):
     # -----------------------------------------------------------------
 
     @classmethod
-    def get_instance(
-        cls,
-        config: Optional[ElmerConfig] = None,
-    ) -> "ElmerHook":
-        """Return the singleton ElmerHook instance."""
+    def get_instance(cls, config: Optional[ElmerConfig] = None) -> "ElmerHook":
         if cls._instance is None:
             cls._instance = cls(config=config)
         return cls._instance
 
     @classmethod
     def reset_instance(cls) -> None:
-        """Reset singleton (testing only)."""
         if cls._instance is not None:
             cls._instance.stop()
         cls._instance = None
@@ -130,7 +123,6 @@ class ElmerHook(OpenClawAdapter):
         """Start the Elmer engine and all subsystems."""
         if self._started:
             return {"status": "already_started"}
-
         result = self._engine.start()
         self._started = True
         logger.info("ElmerHook started")
@@ -146,7 +138,7 @@ class ElmerHook(OpenClawAdapter):
         logger.info("ElmerHook stopped")
 
     # -----------------------------------------------------------------
-    # OpenClawAdapter overrides
+    # OpenClawAdapter overrides  (PRD §7, §8)
     # -----------------------------------------------------------------
 
     def _process_message(
@@ -158,21 +150,28 @@ class ElmerHook(OpenClawAdapter):
         """Elmer-specific message processing through pipelines.
 
         Routes: sensory → inference → memory store.
+        Autonomic state modulates processing priority (§7).
         """
         try:
-            # Sensory pipeline: raw text → structured signal
+            # Read autonomic state  (PRD §7 — read only, never write)
+            autonomic = self._autonomic.read()
+
+            # Sensory pipeline → observation signal
             sensory_signal = self._sensory.process(text)
 
-            # Inference pipeline: comprehend + reason
+            # Inference pipeline → coherence signal
             inference_signal = self._inference.process(sensory_signal)
 
-            # Memory pipeline: store for future recall
+            # Memory pipeline → store
             self._memory.store(inference_signal)
 
             result["elmer"] = {
                 "sensory_signal": sensory_signal.signal_id,
                 "inference_signal": inference_signal.signal_id,
                 "pipelines_active": True,
+                "autonomic_state": autonomic.state.value,
+                "coherence_score": inference_signal.coherence_score,
+                "coherence_status": inference_signal.coherence_status,
             }
 
         except Exception as exc:
@@ -187,15 +186,19 @@ class ElmerHook(OpenClawAdapter):
         embedding: np.ndarray,
         context: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        """Add Elmer-specific context (memory recall, identity)."""
+        """Add Elmer-specific context (memory, identity, autonomic)."""
         try:
             # Memory recall
             memory_signal = self._memory.recall(text)
-            context["memory"] = memory_signal.payload
+            context["memory"] = memory_signal.metadata
 
             # Identity context
             identity_signal = self._identity.query()
-            context["identity"] = identity_signal.payload
+            context["identity"] = identity_signal.metadata.get("identity", {})
+
+            # Autonomic awareness  (PRD §7)
+            autonomic = self._autonomic.read()
+            context["autonomic_state"] = autonomic.state.value
 
         except Exception as exc:
             logger.debug("Context enrichment failed: %s", exc)
@@ -203,16 +206,16 @@ class ElmerHook(OpenClawAdapter):
         return context
 
     def _derive_target(self, text: str) -> str:
-        """Elmer uses signal-type based targeting."""
         return "elmer:substrate_input"
 
     # -----------------------------------------------------------------
-    # Health
+    # Health  (PRD §14)
     # -----------------------------------------------------------------
 
     def health(self) -> Dict[str, Any]:
-        """Comprehensive health report from all Elmer subsystems."""
+        """Comprehensive health report with §14 threshold status."""
         engine_health = self._engine.health() if self._started else {"status": "offline"}
+        health_signal = self._health.check()
 
         return {
             "module": "elmer",
@@ -226,5 +229,7 @@ class ElmerHook(OpenClawAdapter):
                 "memory": self._memory.stats(),
                 "identity": self._identity.stats(),
             },
+            "autonomic_state": self._autonomic.read().state.value,
+            "coherence_status": health_signal.coherence_status,
             "ecosystem": self.stats(),
         }

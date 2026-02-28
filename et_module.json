@@ -1,14 +1,36 @@
 {
   "module_id": "elmer",
   "display_name": "Elmer",
-  "version": "0.1.0",
-  "description": "Cognitive substrate module — processes SubstrateSignals through a socket-based processing architecture integrated with the NG learning ecosystem",
+  "version": "0.2.0",
+  "description": "Cognitive substrate module — graph topology awareness, identity coherence, health monitoring",
   "install_path": "",
   "git_remote": "https://github.com/greatnorthernfishguy-hub/Elmer.git",
   "git_branch": "main",
   "entry_point": "elmer_hook.py",
   "ng_lite_version": "1.0.0",
-  "dependencies": [],
+  "dependencies": ["neurograph"],
   "service_name": "",
-  "api_port": 0
+  "api_port": 0,
+  "ecosystem": {
+    "tier_range": [1, 3],
+    "signal_types": ["observation", "anomaly", "coherence", "health"],
+    "autonomic_reader": true,
+    "autonomic_writer": false
+  },
+  "sockets": {
+    "comprehension": {
+      "type": "comprehension",
+      "hardware": {
+        "gpu_required": false,
+        "min_memory_mb": 256
+      }
+    },
+    "monitoring": {
+      "type": "monitoring",
+      "hardware": {
+        "gpu_required": false,
+        "min_memory_mb": 128
+      }
+    }
+  }
 }

@@ -1,110 +1,136 @@
-"""Tests for ElmerSocket implementations (ComprehensionSocket, MonitoringSocket)."""
+"""Tests for ElmerSocket implementations (PRD §5.2.1)."""
 
 import pytest
 
-from core.base_socket import ElmerSocket
+from core.base_socket import ElmerSocket, GraphSnapshot, HardwareRequirements, SocketHealth
 from core.comprehension import ComprehensionSocket
 from core.monitoring import MonitoringSocket
-from ng_ecosystem import SubstrateSignal, SignalType
+
+
+def _empty_snapshot() -> GraphSnapshot:
+    return GraphSnapshot.empty()
+
+
+def _populated_snapshot() -> GraphSnapshot:
+    return GraphSnapshot(
+        nodes=[
+            {"id": "a", "type": "concept"},
+            {"id": "b", "type": "concept"},
+            {"id": "c", "type": "concept"},
+        ],
+        edges=[
+            {"source": "a", "target": "b", "weight": 0.8},
+            {"source": "b", "target": "c", "weight": 0.5},
+        ],
+        metadata={"test": True},
+    )
 
 
 class TestComprehensionSocket:
     def test_socket_id(self):
         s = ComprehensionSocket()
         assert s.socket_id == "elmer:comprehension"
-        assert s.socket_type == "sensory"
+        assert s.socket_type == "comprehension"
 
-    def test_connect_disconnect(self):
+    def test_declare_requirements(self):
         s = ComprehensionSocket()
-        assert not s.is_connected
-        s.connect()
-        assert s.is_connected
-        s.disconnect()
-        assert not s.is_connected
+        req = s.declare_requirements()
+        assert isinstance(req, HardwareRequirements)
+        assert req.min_memory_mb == 256
+        assert req.gpu_required is False
 
-    def test_idempotent_connect(self):
+    def test_load_unload(self):
         s = ComprehensionSocket()
-        s.connect()
-        s.connect()  # Should not raise
-        assert s.is_connected
+        assert not s.is_loaded
+        assert s.load("models/comprehension") is True
+        assert s.is_loaded
+        s.unload()
+        assert not s.is_loaded
+
+    def test_idempotent_load(self):
+        s = ComprehensionSocket()
+        assert s.load("models/comprehension") is True
+        assert s.load("models/comprehension") is True  # Should not error
+        assert s.is_loaded
 
     def test_process(self):
         s = ComprehensionSocket()
-        s.connect()
+        s.load("models/comprehension")
 
-        signal = SubstrateSignal.create(
-            source_socket="test:input",
-            signal_type=SignalType.SENSORY,
-            payload={"text": "hello world"},
-        )
-        result = s.process(signal)
+        snap = _populated_snapshot()
+        out = s.process(snap, {})
 
-        assert result.source_socket == "elmer:comprehension"
-        assert result.metadata.get("comprehension_processed") is True
-        assert result.payload == signal.payload
+        assert out.signal.signal_type == "observation"
+        assert out.signal.module_id == "elmer"
+        assert out.confidence > 0
+        assert out.processing_time >= 0
+        assert "socket" in out.signal.metadata
 
-    def test_process_not_connected(self):
+    def test_process_empty_snapshot(self):
         s = ComprehensionSocket()
-        signal = SubstrateSignal.create(
-            source_socket="test:input",
-            signal_type=SignalType.SENSORY,
-            payload={},
-        )
-        with pytest.raises(RuntimeError, match="not connected"):
-            s.process(signal)
+        s.load("models/comprehension")
+        out = s.process(_empty_snapshot(), {})
+        assert out.signal.coherence_score == 1.0  # no nodes → full coherence
 
-    def test_health_check_connected(self):
+    def test_process_not_loaded(self):
         s = ComprehensionSocket()
-        s.connect()
-        health = s.health_check()
-        assert health["status"] == "healthy"
-        assert health["socket_id"] == "elmer:comprehension"
-        assert health["connected"] is True
+        with pytest.raises(RuntimeError, match="not loaded"):
+            s.process(_empty_snapshot(), {})
 
-    def test_health_check_disconnected(self):
+    def test_health_loaded(self):
         s = ComprehensionSocket()
-        health = s.health_check()
-        assert health["status"] == "offline"
+        s.load("models/comprehension")
+        h = s.health()
+        assert isinstance(h, SocketHealth)
+        assert h.status == "healthy"
 
-    def test_hardware_affinity(self):
+    def test_health_not_loaded(self):
         s = ComprehensionSocket()
-        assert s.hardware_affinity == "cpu"
+        h = s.health()
+        assert h.status == "offline"
 
     def test_is_elmer_socket(self):
-        s = ComprehensionSocket()
-        assert isinstance(s, ElmerSocket)
+        assert isinstance(ComprehensionSocket(), ElmerSocket)
 
 
 class TestMonitoringSocket:
     def test_socket_id(self):
         s = MonitoringSocket()
         assert s.socket_id == "elmer:monitoring"
-        assert s.socket_type == "health"
+        assert s.socket_type == "monitoring"
 
-    def test_connect_disconnect(self):
+    def test_declare_requirements(self):
+        req = MonitoringSocket().declare_requirements()
+        assert req.min_memory_mb == 128
+
+    def test_load_unload(self):
         s = MonitoringSocket()
-        s.connect()
-        assert s.is_connected
-        s.disconnect()
-        assert not s.is_connected
+        s.load("models/monitoring")
+        assert s.is_loaded
+        s.unload()
+        assert not s.is_loaded
 
-    def test_process(self):
+    def test_process_healthy_graph(self):
         s = MonitoringSocket()
-        s.connect()
+        s.load("models/monitoring")
+        out = s.process(_populated_snapshot(), {})
+        assert out.signal.signal_type in ("health", "anomaly")
+        assert out.signal.health_score >= 0
+        assert out.signal.anomaly_level >= 0
 
-        signal = SubstrateSignal.create(
-            source_socket="test:health",
-            signal_type=SignalType.HEALTH,
-            payload={"status": "ok"},
+    def test_process_disconnected_nodes(self):
+        """Graph with disconnected nodes should report anomaly."""
+        s = MonitoringSocket()
+        s.load("models/monitoring")
+        snap = GraphSnapshot(
+            nodes=[{"id": "a"}, {"id": "b"}, {"id": "c"}],
+            edges=[{"source": "a", "target": "b"}],
         )
-        result = s.process(signal)
+        out = s.process(snap, {})
+        assert out.signal.anomaly_level > 0  # node "c" is disconnected
 
-        assert result.source_socket == "elmer:monitoring"
-        assert result.metadata.get("monitoring_processed") is True
-
-    def test_health_check(self):
+    def test_health(self):
         s = MonitoringSocket()
-        s.connect()
-        health = s.health_check()
-        assert health["status"] == "healthy"
-        assert health["socket_type"] == "health"
+        s.load("models/monitoring")
+        h = s.health()
+        assert h.status == "healthy"

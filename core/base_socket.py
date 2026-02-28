@@ -1,58 +1,121 @@
 """
-ElmerSocket — Abstract Base Class for Elmer Processing Sockets
+ElmerSocket — Abstract Base Class for Elmer Processing Sockets  (PRD §5.2.1)
 
-Every processing unit in Elmer implements this interface.  Sockets are
-the atomic processing elements: they receive a SubstrateSignal, transform
-it, and emit a new SubstrateSignal.  The SocketManager handles lifecycle,
-hardware allocation, and signal routing.
+Every processing unit in Elmer implements this interface.  Sockets receive
+a GraphSnapshot, process it, and return a SocketOutput containing a
+SubstrateSignal and optional graph delta.
 
-Design: Inspired by the neuroscience concept of "processing sockets" —
-specific brain regions that receive, transform, and relay signals
-through the substrate.
+Supporting data structures (PRD §5.2.2):
+  GraphSnapshot   — point-in-time view of the NG-Lite graph
+  SocketOutput    — result of socket processing
+  HardwareRequirements — what a socket needs to run
+  SocketHealth    — runtime health telemetry
 
 # ---- Changelog ----
-# [2026-02-28] Claude (Opus 4.6) — Phase 1 initial creation.
-#   What: ElmerSocket ABC defining the socket contract.
-#   Why:  All Elmer processing units share this interface so the
-#         SocketManager can manage them uniformly.
+# [2026-02-28] Claude (Opus 4.6) — §5.2.1 / §5.2.2 compliant rewrite.
+#   What: ElmerSocket ABC with declare_requirements, load, unload,
+#         process(GraphSnapshot, context) -> SocketOutput, health.
+#         Plus four supporting dataclasses.
+#   Why:  PRD v0.2.0 §5.2 mandates this interface for uniform socket
+#         management and hardware-aware orchestration.
 # -------------------
 """
 
 from __future__ import annotations
 
-import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional
 
 from ng_ecosystem import SubstrateSignal
 
-logger = logging.getLogger("elmer.socket")
 
+# --------------------------------------------------------------------------
+# Data structures  (PRD §5.2.2)
+# --------------------------------------------------------------------------
+
+@dataclass
+class GraphSnapshot:
+    """Point-in-time view of the NG-Lite graph fed to sockets.
+
+    Ref: PRD §5.2.2
+    """
+    nodes: List[Dict[str, Any]] = field(default_factory=list)
+    edges: List[Dict[str, Any]] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    timestamp: float = 0.0
+
+    @classmethod
+    def empty(cls) -> "GraphSnapshot":
+        return cls(timestamp=time.time())
+
+
+@dataclass
+class SocketOutput:
+    """Result of socket processing.
+
+    Ref: PRD §5.2.2
+    """
+    signal: SubstrateSignal
+    graph_delta: Optional[Dict[str, Any]] = None
+    confidence: float = 1.0
+    processing_time: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        return d
+
+
+@dataclass
+class HardwareRequirements:
+    """What a socket needs to run.
+
+    Ref: PRD §5.2.2
+    """
+    min_memory_mb: int = 128
+    gpu_required: bool = False
+    cpu_cores: int = 1
+    disk_mb: int = 0
+
+
+@dataclass
+class SocketHealth:
+    """Runtime health telemetry for a socket.
+
+    Ref: PRD §5.2.2
+    """
+    status: str = "offline"        # "healthy" | "degraded" | "offline"
+    latency_ms: float = 0.0
+    memory_mb: float = 0.0
+    error_count: int = 0
+    last_check: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# --------------------------------------------------------------------------
+# ElmerSocket ABC  (PRD §5.2.1)
+# --------------------------------------------------------------------------
 
 class ElmerSocket(ABC):
     """Abstract base class for all Elmer processing sockets.
 
-    A socket is a self-contained processing unit that:
-      1. Connects to hardware resources (GPU, CPU, NPU)
-      2. Receives SubstrateSignals from the bus
-      3. Processes them (transform, enrich, filter)
-      4. Emits new SubstrateSignals
+    Lifecycle: construct → load(model_path) → process()* → unload()
 
-    Lifecycle: construct → connect() → process()* → disconnect()
-
-    Subclasses MUST implement all abstract methods and properties.
+    Ref: PRD §5.2.1
     """
 
     def __init__(self) -> None:
-        self._connected = False
+        self._loaded = False
         self._process_count = 0
         self._error_count = 0
-        self._last_process_time = 0.0
-        self._connect_time = 0.0
+        self._total_latency = 0.0
+        self._load_time = 0.0
 
     # -----------------------------------------------------------------
-    # Abstract interface
+    # Abstract interface  (PRD §5.2.1)
     # -----------------------------------------------------------------
 
     @property
@@ -68,82 +131,68 @@ class ElmerSocket(ABC):
         ...
 
     @abstractmethod
-    def connect(self) -> None:
-        """Initialize hardware resources and prepare for processing.
+    def declare_requirements(self) -> HardwareRequirements:
+        """Declare hardware requirements for this socket.
 
-        Called by SocketManager during startup.  Should be idempotent.
-        Raises RuntimeError if resources are unavailable.
+        Called by SocketManager before load() to verify resource
+        availability and allocate hardware.
         """
         ...
 
     @abstractmethod
-    def disconnect(self) -> None:
-        """Release hardware resources and clean up.
-
-        Called by SocketManager during shutdown.  Should be idempotent.
-        """
-        ...
-
-    @abstractmethod
-    def process(self, signal: SubstrateSignal) -> SubstrateSignal:
-        """Process an incoming signal and return the transformed result.
-
-        This is the core processing method.  Implementations should:
-          - Validate the incoming signal
-          - Apply domain-specific transformation
-          - Return a new SubstrateSignal (signals are immutable)
+    def load(self, model_path: str) -> bool:
+        """Load models/resources and prepare for processing.
 
         Args:
-            signal: Incoming substrate signal.
+            model_path: Path to model directory or file.
 
         Returns:
-            Transformed substrate signal.
-
-        Raises:
-            ValueError: If the signal is incompatible with this socket.
+            True if loaded successfully, False otherwise.
         """
         ...
 
     @abstractmethod
-    def health_check(self) -> Dict[str, Any]:
-        """Return current health status of this socket.
+    def unload(self) -> None:
+        """Release models/resources.  Should be idempotent."""
+        ...
+
+    @abstractmethod
+    def process(self, snapshot: GraphSnapshot, context: dict) -> SocketOutput:
+        """Process a graph snapshot and return socket output.
+
+        Args:
+            snapshot: Current graph state.
+            context: Processing context (autonomic state, config, etc.).
 
         Returns:
-            Dict with at minimum:
-              - status: "healthy" | "degraded" | "offline"
-              - socket_id: str
-              - socket_type: str
-              - uptime: float (seconds since connect)
+            SocketOutput with SubstrateSignal and optional graph delta.
         """
         ...
 
+    @abstractmethod
+    def health(self) -> SocketHealth:
+        """Return current health telemetry."""
+        ...
+
     # -----------------------------------------------------------------
-    # Concrete properties and methods
+    # Concrete helpers
     # -----------------------------------------------------------------
 
     @property
-    def is_connected(self) -> bool:
-        """Whether this socket is currently connected and ready."""
-        return self._connected
+    def is_loaded(self) -> bool:
+        return self._loaded
 
-    @property
-    def hardware_affinity(self) -> str:
-        """Preferred hardware type: 'gpu', 'cpu', or 'npu'.
-
-        Override in subclasses that have specific hardware preferences.
-        Default is 'cpu'.
-        """
-        return "cpu"
-
-    def _base_health(self) -> Dict[str, Any]:
-        """Common health fields for all sockets."""
-        now = time.time()
-        return {
-            "socket_id": self.socket_id,
-            "socket_type": self.socket_type,
-            "connected": self._connected,
-            "uptime": now - self._connect_time if self._connected else 0.0,
-            "process_count": self._process_count,
-            "error_count": self._error_count,
-            "last_process_time": self._last_process_time,
-        }
+    def _make_health(self, status: str = "healthy") -> SocketHealth:
+        """Build a SocketHealth from internal counters."""
+        avg_latency = (
+            (self._total_latency / self._process_count * 1000)
+            if self._process_count > 0
+            else 0.0
+        )
+        return SocketHealth(
+            status=status if self._loaded else "offline",
+            latency_ms=avg_latency,
+            memory_mb=0.0,  # placeholder — real monitoring in Phase 3
+            error_count=self._error_count,
+            last_check=time.time(),
+        )

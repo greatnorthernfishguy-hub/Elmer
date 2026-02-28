@@ -1,6 +1,6 @@
-"""Tests for all pipeline stubs."""
+"""Tests for all pipelines (PRD §8)."""
 
-from ng_ecosystem import SubstrateSignal, SignalType
+from ng_ecosystem import SubstrateSignal
 from pipelines.sensory import SensoryPipeline
 from pipelines.inference import InferencePipeline
 from pipelines.health import HealthPipeline
@@ -8,64 +8,86 @@ from pipelines.memory import MemoryPipeline
 from pipelines.identity import IdentityPipeline
 
 
+def _obs_signal() -> SubstrateSignal:
+    return SubstrateSignal.create(
+        signal_type="observation",
+        description="test observation",
+        coherence_score=0.8,
+        novelty=0.3,
+    )
+
+
 class TestSensoryPipeline:
     def test_process(self):
         p = SensoryPipeline()
         sig = p.process("hello world")
-        assert sig.signal_type == SignalType.SENSORY
-        assert sig.payload["text"] == "hello world"
-        assert sig.payload["input_length"] == 11
-        assert sig.source_socket == "pipeline:sensory"
+        assert sig.signal_type == "observation"
+        assert sig.module_id == "elmer"
+        assert sig.metadata["text_length"] == 11
+        assert sig.metadata["text_preview"] == "hello world"
+
+    def test_novelty_scaling(self):
+        p = SensoryPipeline()
+        short = p.process("hi")
+        long = p.process("x" * 2000)
+        assert short.novelty < long.novelty
+        assert long.novelty == 1.0  # capped at 1.0
 
     def test_stats(self):
         p = SensoryPipeline()
         p.process("a")
         p.process("b")
-        stats = p.stats()
-        assert stats["process_count"] == 2
+        assert p.stats()["process_count"] == 2
 
 
 class TestInferencePipeline:
     def test_process(self):
         p = InferencePipeline()
-        input_sig = SubstrateSignal.create(
-            source_socket="test",
-            signal_type=SignalType.SENSORY,
-            payload={"text": "test"},
-        )
-        result = p.process(input_sig)
-        assert result.signal_type == SignalType.INFERENCE
-        assert result.payload["text"] == "test"
-        assert result.metadata["parent_signal"] == input_sig.signal_id
+        obs = _obs_signal()
+        result = p.process(obs)
+        assert result.signal_type == "coherence"
+        assert result.metadata["parent_signal"] == obs.signal_id
+        assert result.coherence_score == obs.coherence_score
+
+    def test_confidence_calibration(self):
+        p = InferencePipeline()
+        obs = _obs_signal()
+        result = p.process(obs)
+        # Slight calibration loss
+        assert result.confidence < obs.confidence
 
     def test_stats(self):
         p = InferencePipeline()
-        sig = SubstrateSignal.create(
-            source_socket="test",
-            signal_type=SignalType.SENSORY,
-            payload={},
-        )
-        p.process(sig)
+        p.process(_obs_signal())
         assert p.stats()["process_count"] == 1
 
 
 class TestHealthPipeline:
-    def test_check(self):
+    def test_check_healthy(self):
         p = HealthPipeline()
-        sig = p.check()
-        assert sig.signal_type == SignalType.HEALTH
-        assert sig.payload["status"] == "healthy"
-        assert sig.payload["check_count"] == 1
+        sig = p.check(coherence=0.85)
+        assert sig.signal_type == "health"
+        assert sig.severity == 0.0
+        assert sig.coherence_status == "healthy"
+
+    def test_check_degraded(self):
+        p = HealthPipeline()
+        sig = p.check(coherence=0.50)
+        assert sig.severity == 0.3
+        assert sig.coherence_status == "degraded"
+
+    def test_check_critical(self):
+        p = HealthPipeline()
+        sig = p.check(coherence=0.10)
+        assert sig.severity == 1.0
+        assert sig.coherence_status == "critical"
 
     def test_process(self):
         p = HealthPipeline()
-        input_sig = SubstrateSignal.create(
-            source_socket="test",
-            signal_type=SignalType.HEALTH,
-            payload={"alert": "none"},
-        )
-        result = p.process(input_sig)
+        obs = _obs_signal()
+        result = p.process(obs)
         assert result.metadata.get("health_processed") is True
+        assert result.metadata.get("coherence_status") is not None
 
     def test_stats(self):
         p = HealthPipeline()
@@ -78,49 +100,31 @@ class TestHealthPipeline:
 class TestMemoryPipeline:
     def test_store(self):
         p = MemoryPipeline()
-        sig = SubstrateSignal.create(
-            source_socket="test",
-            signal_type=SignalType.SENSORY,
-            payload={"text": "remember this"},
-        )
-        result = p.store(sig)
-        assert result.signal_type == SignalType.MEMORY
-        assert result.payload["action"] == "stored"
-        assert result.payload["buffer_size"] == 1
+        obs = _obs_signal()
+        result = p.store(obs)
+        assert result.signal_type == "observation"
+        assert result.metadata["action"] == "stored"
+        assert result.metadata["buffer_size"] == 1
 
     def test_recall(self):
         p = MemoryPipeline()
-        sig = SubstrateSignal.create(
-            source_socket="test",
-            signal_type=SignalType.SENSORY,
-            payload={"text": "data"},
-        )
-        p.store(sig)
-        result = p.recall("data")
-        assert result.signal_type == SignalType.MEMORY
-        assert result.payload["action"] == "recalled"
-        assert result.payload["recalled_count"] == 1
+        obs = _obs_signal()
+        p.store(obs)
+        result = p.recall("test query")
+        assert result.signal_type == "observation"
+        assert result.metadata["action"] == "recalled"
+        assert result.metadata["recalled_count"] == 1
 
     def test_bounded_buffer(self):
         p = MemoryPipeline(max_signals=3)
         for i in range(5):
-            sig = SubstrateSignal.create(
-                source_socket="test",
-                signal_type=SignalType.SENSORY,
-                payload={"i": i},
-            )
-            p.store(sig)
+            p.store(_obs_signal())
         result = p.recall("any", k=10)
-        assert result.payload["recalled_count"] == 3
+        assert result.metadata["recalled_count"] == 3
 
     def test_stats(self):
         p = MemoryPipeline()
-        sig = SubstrateSignal.create(
-            source_socket="test",
-            signal_type=SignalType.SENSORY,
-            payload={},
-        )
-        p.store(sig)
+        p.store(_obs_signal())
         p.recall("x")
         stats = p.stats()
         assert stats["store_count"] == 1
@@ -132,20 +136,16 @@ class TestIdentityPipeline:
     def test_query(self):
         p = IdentityPipeline()
         sig = p.query()
-        assert sig.signal_type == SignalType.IDENTITY
-        assert sig.payload["name"] == "Elmer"
-        assert sig.payload["module_id"] == "elmer"
-        assert sig.payload["version"] == "0.1.0"
+        assert sig.signal_type == "coherence"
+        assert sig.identity_coherence == 1.0
+        assert sig.metadata["identity"]["name"] == "Elmer"
 
     def test_process(self):
         p = IdentityPipeline()
-        input_sig = SubstrateSignal.create(
-            source_socket="test",
-            signal_type=SignalType.SENSORY,
-            payload={"text": "who are you?"},
-        )
-        result = p.process(input_sig)
+        obs = _obs_signal()
+        result = p.process(obs)
         assert result.metadata["identity"] == "Elmer"
+        assert result.metadata["identity_version"] == "0.2.0"
 
     def test_stats(self):
         p = IdentityPipeline()

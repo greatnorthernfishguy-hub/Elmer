@@ -1,4 +1,4 @@
-"""Tests for ElmerHook (OpenClawAdapter subclass)."""
+"""Tests for ElmerHook (PRD §7, §9)."""
 
 import pytest
 
@@ -28,8 +28,11 @@ class TestElmerHook:
         result = hook.on_message("Hello, Elmer!")
         assert result["status"] == "ingested"
         assert result["tier"] >= 1
-        assert "elmer" in result  # Pipeline enrichment
+        assert "elmer" in result
         assert result["elmer"]["pipelines_active"] is True
+        assert "autonomic_state" in result["elmer"]
+        assert "coherence_score" in result["elmer"]
+        assert "coherence_status" in result["elmer"]
 
     def test_on_message_empty(self):
         hook = ElmerHook()
@@ -44,6 +47,7 @@ class TestElmerHook:
         assert "novelty" in context
         assert "memory" in context
         assert "identity" in context
+        assert "autonomic_state" in context
 
     def test_get_context_empty(self):
         hook = ElmerHook()
@@ -61,9 +65,11 @@ class TestElmerHook:
         hook = ElmerHook()
         health = hook.health()
         assert health["module"] == "elmer"
-        assert health["version"] == "0.1.0"
+        assert health["version"] == "0.2.0"
         assert "pipelines" in health
         assert "sensory" in health["pipelines"]
+        assert "autonomic_state" in health
+        assert "coherence_status" in health
 
     def test_start_stop(self):
         hook = ElmerHook()

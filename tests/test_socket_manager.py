@@ -1,11 +1,18 @@
-"""Tests for the SocketManager."""
+"""Tests for the SocketManager (PRD §5.2)."""
 
 import pytest
 
+from core.base_socket import GraphSnapshot
 from core.socket_manager import SocketManager
 from core.comprehension import ComprehensionSocket
 from core.monitoring import MonitoringSocket
-from ng_ecosystem import SubstrateSignal, SignalType
+
+
+def _snap() -> GraphSnapshot:
+    return GraphSnapshot(
+        nodes=[{"id": "a"}, {"id": "b"}],
+        edges=[{"source": "a", "target": "b"}],
+    )
 
 
 class TestSocketManager:
@@ -24,84 +31,76 @@ class TestSocketManager:
     def test_register_at_capacity(self):
         mgr = SocketManager(max_sockets=1)
         mgr.register(ComprehensionSocket())
-        with pytest.raises(ValueError, match="limit reached"):
+        with pytest.raises(RuntimeError, match="Max sockets"):
             mgr.register(MonitoringSocket())
 
-    def test_connect_all(self):
+    def test_load_all(self):
         mgr = SocketManager()
         mgr.register(ComprehensionSocket())
         mgr.register(MonitoringSocket())
-        results = mgr.connect_all()
+        results = mgr.load_all()
         assert results["elmer:comprehension"] is True
         assert results["elmer:monitoring"] is True
 
-    def test_disconnect_all(self):
+    def test_unload_all(self):
         mgr = SocketManager()
         mgr.register(ComprehensionSocket())
-        mgr.connect_all()
-        mgr.disconnect_all()
+        mgr.load_all()
+        mgr.unload_all()
         sock = mgr.get_socket("elmer:comprehension")
         assert sock is not None
-        assert not sock.is_connected
+        assert not sock.is_loaded
 
-    def test_route_signal_sensory(self):
+    def test_route_comprehension(self):
         mgr = SocketManager()
         mgr.register(ComprehensionSocket())
-        mgr.connect_all()
+        mgr.load_all()
 
-        signal = SubstrateSignal.create(
-            source_socket="test:input",
-            signal_type=SignalType.SENSORY,
-            payload={"text": "route me"},
-        )
-        result = mgr.route_signal(signal)
-        assert result.source_socket == "elmer:comprehension"
+        outputs = mgr.route(_snap(), {}, socket_type="comprehension")
+        assert len(outputs) == 1
+        assert outputs[0].signal.signal_type == "observation"
 
-    def test_route_signal_health(self):
+    def test_route_monitoring(self):
         mgr = SocketManager()
         mgr.register(MonitoringSocket())
-        mgr.connect_all()
+        mgr.load_all()
 
-        signal = SubstrateSignal.create(
-            source_socket="test:input",
-            signal_type=SignalType.HEALTH,
-            payload={"status": "check"},
-        )
-        result = mgr.route_signal(signal)
-        assert result.source_socket == "elmer:monitoring"
+        outputs = mgr.route(_snap(), {}, socket_type="monitoring")
+        assert len(outputs) == 1
+        assert outputs[0].signal.signal_type in ("health", "anomaly")
 
-    def test_route_signal_no_match(self):
+    def test_route_all(self):
         mgr = SocketManager()
         mgr.register(ComprehensionSocket())
-        mgr.connect_all()
+        mgr.register(MonitoringSocket())
+        mgr.load_all()
 
-        signal = SubstrateSignal.create(
-            source_socket="test:input",
-            signal_type=SignalType.MEMORY,  # No memory socket registered
-            payload={"query": "something"},
-        )
-        result = mgr.route_signal(signal)
-        # Pass-through: original signal returned unchanged
-        assert result.source_socket == "test:input"
+        outputs = mgr.route(_snap(), {})
+        assert len(outputs) == 2
+
+    def test_route_no_match(self):
+        mgr = SocketManager()
+        mgr.register(ComprehensionSocket())
+        mgr.load_all()
+
+        outputs = mgr.route(_snap(), {}, socket_type="nonexistent")
+        assert len(outputs) == 0
 
     def test_health_report(self):
         mgr = SocketManager()
         mgr.register(ComprehensionSocket())
         mgr.register(MonitoringSocket())
-        mgr.connect_all()
+        mgr.load_all()
 
         report = mgr.health_report()
-        assert report["status"] == "healthy"
-        assert report["socket_count"] == 2
-        assert report["connected_count"] == 2
-        assert "elmer:comprehension" in report["sockets"]
-        assert "elmer:monitoring" in report["sockets"]
+        assert "elmer:comprehension" in report
+        assert "elmer:monitoring" in report
+        assert report["elmer:comprehension"]["status"] == "healthy"
 
     def test_health_report_empty(self):
         mgr = SocketManager()
         report = mgr.health_report()
-        assert report["status"] == "no_sockets"
-        assert report["socket_count"] == 0
+        assert len(report) == 0
 
     def test_list_sockets(self):
         mgr = SocketManager()
@@ -109,15 +108,16 @@ class TestSocketManager:
         sockets = mgr.list_sockets()
         assert len(sockets) == 1
         assert sockets[0]["socket_id"] == "elmer:comprehension"
+        assert "requirements" in sockets[0]
 
     def test_unregister(self):
         mgr = SocketManager()
         mgr.register(ComprehensionSocket())
-        mgr.connect_all()
+        mgr.load_all()
         mgr.unregister("elmer:comprehension")
         assert mgr.get_socket("elmer:comprehension") is None
 
     def test_detect_hardware(self):
         hw = SocketManager.detect_hardware()
-        assert hw["cpu"]["available"] is True
-        assert hw["cpu"]["cores"] >= 1
+        assert hw["cpu_cores"] >= 1
+        assert isinstance(hw["gpu_available"], bool)

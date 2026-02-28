@@ -79,7 +79,7 @@ class ElmerConfig:
     """
     module_id: str = "elmer"
     display_name: str = "Elmer"
-    version: str = "0.1.0"
+    version: str = "0.2.0"
     log_level: str = "INFO"
     data_dir: str = "~/.elmer"
 
