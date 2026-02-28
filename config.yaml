@@ -1,0 +1,41 @@
+# Elmer Configuration — Phase 1 (Foundation v0.1)
+#
+# All values have sensible defaults. Override only what you need.
+# Environment variables: use ${VAR_NAME} syntax for interpolation.
+
+module_id: elmer
+display_name: Elmer
+version: "0.1.0"
+log_level: INFO
+data_dir: "~/.elmer"
+
+# Hardware detection and allocation
+hardware:
+  prefer_gpu: true
+  gpu_memory_fraction: 0.5
+  cpu_threads: 0          # 0 = auto-detect
+  enable_npu: false
+
+# Socket manager
+sockets:
+  max_sockets: 16
+  health_check_interval: 30.0
+  connect_timeout: 10.0
+  default_priority: 5
+
+# NG ecosystem (learning substrate)
+ng_ecosystem:
+  module_id: elmer
+  state_path: ""          # Empty = default (~/.et_modules/elmer/ng_lite_state.json)
+  peer_bridge_enabled: true
+  peer_sync_interval: 100
+  tier3_upgrade_enabled: true
+  tier3_poll_interval: 300.0
+
+# Processing pipelines
+pipelines:
+  sensory_enabled: true
+  inference_enabled: true
+  health_enabled: true
+  memory_enabled: true
+  identity_enabled: true

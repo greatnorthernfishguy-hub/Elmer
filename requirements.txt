@@ -1,0 +1,12 @@
+# Elmer — Phase 1 (Foundation v0.1)
+# Core dependencies only. ML/embedding deps are optional.
+
+numpy>=1.24.0
+pyyaml>=6.0
+
+# Optional: real embeddings (Phase 2+)
+# sentence-transformers>=2.2.0
+# torch>=2.0.0
+
+# Testing
+pytest>=7.0.0
