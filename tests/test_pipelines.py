@@ -1,6 +1,6 @@
 """Tests for all pipelines (PRD §8)."""
 
-from ng_ecosystem import SubstrateSignal
+from core.substrate_signal import SubstrateSignal
 from pipelines.sensory import SensoryPipeline
 from pipelines.inference import InferencePipeline
 from pipelines.health import HealthPipeline

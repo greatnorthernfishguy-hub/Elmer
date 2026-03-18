@@ -24,7 +24,7 @@ from core.base_socket import (
     SocketHealth,
     SocketOutput,
 )
-from ng_ecosystem import (
+from core.substrate_signal import (
     COHERENCE_CRITICAL,
     COHERENCE_DEGRADED,
     COHERENCE_HEALTHY,

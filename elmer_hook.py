@@ -30,6 +30,12 @@ stats() / health():
 
 from __future__ import annotations
 
+# Auto-update on startup — pull latest code + sync vendored files
+try:
+    from ng_updater import auto_update; auto_update()
+except Exception:
+    pass  # Never prevent module startup
+
 import logging
 import time
 from typing import Any, Dict, Optional
@@ -37,8 +43,8 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from core.config import ElmerConfig, load_config
-from ng_autonomic import AutonomicMonitor, AutonomicState
-from ng_ecosystem import COHERENCE_HEALTHY, SubstrateSignal
+import ng_autonomic
+from core.substrate_signal import COHERENCE_HEALTHY, SubstrateSignal
 from openclaw_adapter import OpenClawAdapter
 from pipelines.health import HealthPipeline
 from pipelines.identity import IdentityPipeline
@@ -62,33 +68,23 @@ class ElmerHook(OpenClawAdapter):
     Ref: PRD §7, §9
     """
 
+    MODULE_ID = "elmer"
+    SKILL_NAME = "Elmer Cognitive Substrate"
+    WORKSPACE_ENV = "ELMER_WORKSPACE_DIR"
+    DEFAULT_WORKSPACE = "~/.openclaw/elmer"
+
     _instance: Optional["ElmerHook"] = None
 
     def __init__(
         self,
         config: Optional[ElmerConfig] = None,
-        embedder_fn: Optional[Any] = None,
     ) -> None:
         self._elmer_config = config or load_config()
 
-        super().__init__(
-            module_id=self._elmer_config.module_id,
-            embedder_fn=embedder_fn,
-            state_path=self._elmer_config.ng_ecosystem.state_path or None,
-            config={
-                "peer_bridge": {
-                    "enabled": self._elmer_config.ng_ecosystem.peer_bridge_enabled,
-                    "sync_interval": self._elmer_config.ng_ecosystem.peer_sync_interval,
-                },
-                "tier3_upgrade": {
-                    "enabled": self._elmer_config.ng_ecosystem.tier3_upgrade_enabled,
-                    "poll_interval": self._elmer_config.ng_ecosystem.tier3_poll_interval,
-                },
-            },
-        )
+        super().__init__()
 
         self._engine = ElmerEngine(config=self._elmer_config)
-        self._autonomic = AutonomicMonitor()
+        # Autonomic state read via ng_autonomic.read_state() (read-only, PRD §7)
 
         # Pipelines  (PRD §8)
         self._sensory = SensoryPipeline()
@@ -114,6 +110,25 @@ class ElmerHook(OpenClawAdapter):
         if cls._instance is not None:
             cls._instance.stop()
         cls._instance = None
+
+    # -----------------------------------------------------------------
+    # Embedding (OpenClawAdapter abstract method)
+    # -----------------------------------------------------------------
+
+    def _embed(self, text: str) -> np.ndarray:
+        """Embed text using fastembed (ONNX Runtime), fall back to hash.
+
+        Ecosystem standard: fastembed/all-MiniLM-L6-v2 (384-dim).
+        No torch dependency.
+        """
+        try:
+            if not hasattr(self, "_fe_model"):
+                from fastembed import TextEmbedding
+                self._fe_model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+            vecs = list(self._fe_model.embed([text]))
+            return np.array(vecs[0], dtype=np.float32)
+        except Exception:
+            return self._hash_embed(text)
 
     # -----------------------------------------------------------------
     # Lifecycle
@@ -154,7 +169,7 @@ class ElmerHook(OpenClawAdapter):
         """
         try:
             # Read autonomic state  (PRD §7 — read only, never write)
-            autonomic = self._autonomic.read()
+            autonomic_state = ng_autonomic.read_state().get("state", "PARASYMPATHETIC")
 
             # Sensory pipeline → observation signal
             sensory_signal = self._sensory.process(text)
@@ -169,7 +184,7 @@ class ElmerHook(OpenClawAdapter):
                 "sensory_signal": sensory_signal.signal_id,
                 "inference_signal": inference_signal.signal_id,
                 "pipelines_active": True,
-                "autonomic_state": autonomic.state.value,
+                "autonomic_state": autonomic_state,
                 "coherence_score": inference_signal.coherence_score,
                 "coherence_status": inference_signal.coherence_status,
             }
@@ -197,8 +212,8 @@ class ElmerHook(OpenClawAdapter):
             context["identity"] = identity_signal.metadata.get("identity", {})
 
             # Autonomic awareness  (PRD §7)
-            autonomic = self._autonomic.read()
-            context["autonomic_state"] = autonomic.state.value
+            autonomic_state = ng_autonomic.read_state().get("state", "PARASYMPATHETIC")
+            context["autonomic_state"] = autonomic_state
 
         except Exception as exc:
             logger.debug("Context enrichment failed: %s", exc)
@@ -229,7 +244,7 @@ class ElmerHook(OpenClawAdapter):
                 "memory": self._memory.stats(),
                 "identity": self._identity.stats(),
             },
-            "autonomic_state": self._autonomic.read().state.value,
+            "autonomic_state": ng_autonomic.read_state().get("state", "PARASYMPATHETIC"),
             "coherence_status": health_signal.coherence_status,
             "ecosystem": self.stats(),
         }

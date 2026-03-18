@@ -25,7 +25,7 @@ from core.base_socket import (
     SocketHealth,
     SocketOutput,
 )
-from ng_ecosystem import SubstrateSignal
+from core.substrate_signal import SubstrateSignal
 
 logger = logging.getLogger("elmer.comprehension")
 

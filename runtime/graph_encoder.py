@@ -23,7 +23,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from core.base_socket import GraphSnapshot
-from ng_ecosystem import SubstrateSignal
+from core.substrate_signal import SubstrateSignal
 
 logger = logging.getLogger("elmer.graph_encoder")
 
@@ -110,7 +110,7 @@ class GraphEncoder:
     def _embed(self, text: str) -> np.ndarray:
         """Hash-based deterministic embedding (testing fallback).
 
-        Production: replace with sentence-transformers or Ollama.
+        Production: replace with fastembed or Ollama.
         """
         h = hashlib.sha256(text.encode()).digest()
         repeats = (self._embedding_dim * 4 // len(h)) + 1

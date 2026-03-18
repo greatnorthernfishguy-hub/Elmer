@@ -1,0 +1,204 @@
+# Elmer Repository
+## Claude Code Onboarding — Repo-Specific
+
+**You have already read the global `CLAUDE.md` and `ARCHITECTURE.md`.**
+**If you have not, stop. Go read them. The Laws defined there govern this repo.**
+**This document adds Elmer-specific rules on top of those Laws.**
+
+---
+
+## What This Repo Is
+
+Elmer is the brainstem and cerebellum of the E-T Systems digital organism. It maintains the conditions for cognition — substrate health monitoring, topology awareness, identity coherence tracking. Elmer does not think. Elmer ensures that thinking can happen.
+
+Elmer is part of the **Triad** (Immunis, Elmer, THC). The Triad forms a closed-loop self-regulating system:
+- **Immunis** detects host-level threats
+- **Elmer** maintains substrate-level cognitive conditions
+- **THC** diagnoses and repairs
+
+They do not coordinate directly. The River flows. The topology reshapes itself.
+
+**Status: Built, not integrated.** Vendored files synced to NeuroGraph canonical (2026-03-18). Code is architecturally compliant. Not yet running as a service on the VPS.
+
+---
+
+## 1. Repository Structure
+
+```
+~/Elmer/
+├── elmer_hook.py                  # OpenClaw skill entry point (ElmerHook singleton)
+├── et_module.json                 # Module manifest (v2 schema)
+├── config.yaml                    # All configuration
+├── SKILL.md                       # OpenClaw skill discovery
+├── CHANGELOG.md                   # Version history
+├── core/                          # Core domain logic
+│   ├── substrate_signal.py        # SubstrateSignal dataclass + COHERENCE_* thresholds
+│   ├── config.py                  # ElmerConfig dataclass + loader
+│   ├── base_socket.py             # Socket ABC for processing units
+│   ├── comprehension.py           # ComprehensionSocket — graph topology analysis
+│   ├── monitoring.py              # MonitoringSocket — health dashboard
+│   └── socket_manager.py          # Socket lifecycle management
+├── pipelines/                     # Five-stage processing pipeline
+│   ├── sensory.py                 # Raw text → observation SubstrateSignal
+│   ├── inference.py               # Observation → coherence signal
+│   ├── health.py                  # Coherence → health assessment (§14 thresholds)
+│   ├── memory.py                  # Signal buffer (bounded, 1000 max)
+│   └── identity.py                # Module identity declaration
+├── runtime/                       # Engine and signal encoding
+│   ├── engine.py                  # ElmerEngine — orchestrates sockets + pipelines
+│   ├── graph_encoder.py           # SubstrateSignal → graph-compatible encoding
+│   └── signal_decoder.py          # Graph output → response dict
+├── ng_lite.py                     # VENDORED — canonical from NeuroGraph
+├── ng_peer_bridge.py              # VENDORED — canonical from NeuroGraph
+├── ng_ecosystem.py                # VENDORED — canonical from NeuroGraph
+├── ng_autonomic.py                # VENDORED — canonical from NeuroGraph
+├── openclaw_adapter.py            # VENDORED — canonical from NeuroGraph
+├── et_modules/                    # ET Module Manager integration
+│   ├── __init__.py
+│   └── manager.py
+└── tests/                         # Test suite
+    ├── test_config.py
+    ├── test_hook.py
+    ├── test_pipelines.py
+    ├── test_signal_format.py
+    ├── test_socket_manager.py
+    └── test_sockets.py
+```
+
+---
+
+## 2. Key Architectural Constraint: Elmer Reads, Never Writes Autonomic State
+
+This is the single most important rule specific to Elmer.
+
+Elmer **reads** the autonomic state via `AutonomicMonitor.read()`. Elmer **never writes** to `ng_autonomic.py`. Only Immunis, TrollGuard, and Cricket (when built) have write permission.
+
+This boundary is enforced in:
+- `config.yaml` line 44: `# Elmer reads but NEVER writes autonomic state.`
+- `et_module.json`: `"autonomic_writer": false`
+- `elmer_hook.py` line 156: `autonomic = self._autonomic.read()` — read only
+
+If you are tempted to have Elmer escalate a health issue by writing SYMPATHETIC: **stop**. Elmer records the observation to the substrate. The River carries it to Immunis. Immunis decides whether to escalate. That is the correct flow.
+
+---
+
+## 3. SubstrateSignal — Elmer's Extraction Bucket
+
+`SubstrateSignal` is defined in `core/substrate_signal.py` (Elmer-local, not vendored). It is Elmer's extraction vocabulary — the shape of Elmer's bucket when it dips into the River.
+
+It is **not** an inter-module protocol. No module serializes a SubstrateSignal and sends it to another module. See ARCHITECTURE.md §6-7.
+
+Previously this class lived inside the vendored `ng_ecosystem.py` (Law 2 violation). Extracted to `core/substrate_signal.py` on 2026-03-18.
+
+### Threshold Constants (PRD §14)
+
+```python
+COHERENCE_HEALTHY  = 0.70  # System functioning well
+COHERENCE_DEGRADED = 0.40  # Attention needed
+COHERENCE_CRITICAL = 0.15  # Immediate concern
+```
+
+These are Elmer's extraction thresholds. They are **not** the ecosystem-wide confidence thresholds from `ng_ecosystem.py` (0.70/0.40/0.15 — same values, different purpose). Do not confuse them.
+
+---
+
+## 4. The Processing Pipeline
+
+Every message flows through five pipelines in sequence:
+
+```
+Raw text
+  → SensoryPipeline.process(text)     → observation SubstrateSignal
+  → InferencePipeline.process(signal) → coherence SubstrateSignal
+  → MemoryPipeline.store(signal)      → buffered
+  → HealthPipeline.check()            → §14 threshold assessment
+  → IdentityPipeline.query()          → module identity context
+```
+
+The pipeline feeds raw embeddings to NG-Lite via `NGEcosystem.record_outcome()`. Classification happens only when extracting context via `NGEcosystem.get_context()`. This is correct per Law 7.
+
+---
+
+## 5. Sockets
+
+Elmer uses a socket architecture for processing units:
+
+| Socket | Purpose | GPU Required |
+|--------|---------|-------------|
+| `ComprehensionSocket` | Graph topology analysis | No |
+| `MonitoringSocket` | Health monitoring dashboard | No |
+
+Sockets are managed by `SocketManager` and registered in `et_module.json`. Both are stub implementations in the current version — base class interface is defined, full implementations are future work.
+
+---
+
+## 6. Vendored Files
+
+All five vendored files synced to NeuroGraph canonical on 2026-03-18:
+
+| File | Location | Purpose |
+|------|----------|---------|
+| `ng_lite.py` | Repo root | Tier 1 learning substrate |
+| `ng_peer_bridge.py` | Repo root | Tier 2 cross-module learning |
+| `ng_ecosystem.py` | Repo root | Tier management lifecycle |
+| `ng_autonomic.py` | Repo root | Autonomic state (READ ONLY for Elmer) |
+| `openclaw_adapter.py` | Repo root | OpenClaw skill base class |
+
+**Do not modify vendored files.** If Elmer needs different behavior, that behavior lives in Elmer-specific code (`core/`, `pipelines/`, `runtime/`), not in vendored files.
+
+---
+
+## 7. What Elmer Does NOT Do
+
+- Elmer **never** executes repairs — THC's domain
+- Elmer **never** touches host-level threats — Immunis's domain
+- Elmer **never** writes autonomic state — security modules only
+- Elmer **never** calls other modules directly — Law 1
+
+When Elmer detects something outside its domain, it records to the substrate and steps back. The River carries it to the appropriate module.
+
+---
+
+## 8. Graph Encoder Embedding
+
+`runtime/graph_encoder.py` currently uses SHA256 hash-based deterministic embedding as a fallback. The comment acknowledges this: `"Production: replace with sentence-transformers or Ollama."` This is not a bug — it's a bootstrap placeholder. The ecosystem standard embedding model is `all-MiniLM-L6-v2` via `fastembed` (ONNX Runtime).
+
+---
+
+## 9. What Claude Code May and May Not Do
+
+### Without Josh's Approval
+
+**Permitted:**
+- Read any file in the repo
+- Run the test suite (`tests/`)
+- Edit Elmer-specific files (core/, pipelines/, runtime/, elmer_hook.py)
+- Add or modify tests
+- Update documentation
+
+**Not permitted without explicit Josh approval:**
+- Modify any vendored file
+- Delete any file
+- Add autonomic write capability
+- Restart any service
+- Change the pipeline processing order
+
+---
+
+## 10. Environment and Paths
+
+| What | Where |
+|------|-------|
+| Repo root | `~/Elmer/` |
+| Configuration | `~/Elmer/config.yaml` |
+| Module manifest | `~/Elmer/et_module.json` |
+| Module data (runtime) | `~/.et_modules/elmer/` |
+| Shared learning JSONL | `~/.et_modules/shared_learning/elmer.jsonl` |
+| Peer registry | `~/.et_modules/shared_learning/_peer_registry.json` |
+
+---
+
+*E-T Systems / Elmer*
+*Last updated: 2026-03-18*
+*Maintained by Josh — do not edit without authorization*
+*Parent documents: `~/.claude/CLAUDE.md` (global), `~/.claude/ARCHITECTURE.md`*

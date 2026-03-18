@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from ng_ecosystem import SubstrateSignal
+from core.substrate_signal import SubstrateSignal
 
 logger = logging.getLogger("elmer.pipeline.sensory")
 

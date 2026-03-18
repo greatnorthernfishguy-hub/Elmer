@@ -25,8 +25,9 @@ from core.comprehension import ComprehensionSocket
 from core.config import ElmerConfig, load_config
 from core.monitoring import MonitoringSocket
 from core.socket_manager import SocketManager
-from ng_autonomic import AutonomicMonitor, AutonomicState
-from ng_ecosystem import NGEcosystem, SubstrateSignal
+import ng_autonomic
+from ng_ecosystem import NGEcosystem
+from core.substrate_signal import SubstrateSignal
 from pipelines.health import HealthPipeline
 from pipelines.identity import IdentityPipeline
 from pipelines.inference import InferencePipeline
@@ -54,7 +55,7 @@ class ElmerEngine:
         )
         self._graph_encoder = GraphEncoder()
         self._signal_decoder = SignalDecoder()
-        self._autonomic = AutonomicMonitor()
+        # Autonomic state read via ng_autonomic.read_state() (read-only, PRD §7)
 
         # Pipelines  (PRD §8)
         self._sensory = SensoryPipeline()
@@ -171,10 +172,10 @@ class ElmerEngine:
         self._process_count += 1
 
         # Read autonomic state  (PRD §7)
-        autonomic = self._autonomic.read()
+        autonomic = ng_autonomic.read_state()
         context = {
-            "autonomic_state": autonomic.state.value,
-            "autonomic_intensity": autonomic.intensity,
+            "autonomic_state": autonomic.get("state", "PARASYMPATHETIC"),
+            "autonomic_intensity": autonomic.get("threat_level", "none"),
             "process_id": self._process_count,
         }
 
@@ -220,7 +221,7 @@ class ElmerEngine:
         # 8. Decode to output  (PRD §9)
         result = self._signal_decoder.decode(final_signal)
         result["process_id"] = self._process_count
-        result["autonomic_state"] = autonomic.state.value
+        result["autonomic_state"] = autonomic.get("state", "PARASYMPATHETIC")
         if eco_result:
             result["ecosystem"] = eco_result
         if socket_outputs:
@@ -251,7 +252,7 @@ class ElmerEngine:
             "sockets": socket_health,
             "ecosystem": eco_stats,
             "health_signal": health_signal.to_dict(),
-            "autonomic_state": self._autonomic.read().state.value,
+            "autonomic_state": ng_autonomic.read_state().get("state", "PARASYMPATHETIC"),
             "pipelines": {
                 "sensory": self._sensory.stats(),
                 "inference": self._inference.stats(),

@@ -28,7 +28,7 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
-from ng_ecosystem import SubstrateSignal
+from core.substrate_signal import SubstrateSignal
 
 
 # --------------------------------------------------------------------------
