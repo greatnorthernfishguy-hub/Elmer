@@ -82,7 +82,7 @@ They do not coordinate directly. The River flows. The topology reshapes itself.
 
 This is the single most important rule specific to Elmer.
 
-Elmer **reads** the autonomic state via `AutonomicMonitor.read()`. Elmer **never writes** to `ng_autonomic.py`. Only Immunis, TrollGuard, and Cricket (when built) have write permission.
+Elmer **reads** the autonomic state via `AutonomicMonitor.read()`. Elmer **never writes** to `ng_autonomic.py`. Only Immunis, TrollGuard, and Cricket have write permission.
 
 This boundary is enforced in:
 - `config.yaml` line 44: `# Elmer reads but NEVER writes autonomic state.`
@@ -90,6 +90,12 @@ This boundary is enforced in:
 - `elmer_hook.py` line 156: `autonomic = self._autonomic.read()` — read only
 
 If you are tempted to have Elmer escalate a health issue by writing SYMPATHETIC: **stop**. Elmer records the observation to the substrate. The River carries it to Immunis. Immunis decides whether to escalate. That is the correct flow.
+
+### Exception: Cricket Rim Violations
+
+Cricket (the constitutional constraint layer) is integrated into Elmer as its extraction boundary — Cricket IS the bucket. When the extraction pipeline detects that an input landed on a constitutional node (frozen semantic region), Elmer writes SYMPATHETIC with `threat_level: "constitutional"` and `source: "cricket_rim"`.
+
+This is **not** Elmer deciding to escalate a health issue. This is constitutional enforcement — a mechanically distinct code path in `runtime/engine.py`. The Cricket rim write is the sole exception to Elmer's read-only autonomic rule. See `docs/prd/Cricket_Design_v0.1.md` for full design context.
 
 ---
 

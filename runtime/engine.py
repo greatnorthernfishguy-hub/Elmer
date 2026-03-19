@@ -6,6 +6,18 @@ and the autonomic monitor.  Receives raw input, builds GraphSnapshots,
 routes through sockets, chains pipelines, and returns SocketOutputs.
 
 # ---- Changelog ----
+# [2026-03-19] Claude Code (Opus 4.6) — Cricket rim integration
+# What: Load constitutional embeddings and pass to NGEcosystem/NGLite
+#   on init. Elmer's extraction bucket now enforces the rim —
+#   constitutional nodes in the topology prevent learning in forbidden
+#   semantic space.
+# Why: Cricket Design v0.1 — Cricket IS the bucket. Elmer defines the
+#   bucket's shape, Cricket defines the material. The rim is universal
+#   and lives in the vendored ng_lite.py. Elmer wires the embeddings.
+# How: _load_constitutional_embeddings() reads data/constitutional_embeddings.json.
+#   Embeddings passed to NGEcosystem via config["ng_lite"]["constitutional_embeddings"].
+#   Autonomic write path for rim violations added to process_text().
+# -------------------
 # [2026-02-28] Claude (Opus 4.6) — §5.2/§7/§8/§9 compliant rewrite.
 #   What: ElmerEngine using GraphSnapshot routing, autonomic-aware
 #         context, pipeline chaining, and NG ecosystem integration.
@@ -16,7 +28,9 @@ routes through sockets, chains pipelines, and returns SocketOutputs.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -91,9 +105,15 @@ class ElmerEngine:
         self._socket_manager.register(MonitoringSocket())
         load_results = self._socket_manager.load_all()
 
-        # Initialize NG ecosystem
+        # Initialize NG ecosystem with Cricket rim (constitutional embeddings)
         eco_config = self._config.ng_ecosystem
+        constitutional = self._load_constitutional_embeddings()
         try:
+            ng_lite_config: Dict[str, Any] = {}
+            if constitutional:
+                ng_lite_config["constitutional_embeddings"] = constitutional
+                logger.info("Cricket rim: %d constitutional embeddings loaded", len(constitutional))
+
             self._ecosystem = NGEcosystem.get_instance(
                 module_id=eco_config.module_id,
                 state_path=eco_config.state_path or None,
@@ -106,6 +126,7 @@ class ElmerEngine:
                         "enabled": eco_config.tier3_upgrade_enabled,
                         "poll_interval": eco_config.tier3_poll_interval,
                     },
+                    "ng_lite": ng_lite_config,
                 },
             )
             eco_tier = self._ecosystem.tier
@@ -208,12 +229,30 @@ class ElmerEngine:
                 if encoding and "embedding" in encoding:
                     import numpy as np
                     embedding = np.array(encoding["embedding"])
-                    self._ecosystem.record_outcome(
+                    outcome = self._ecosystem.record_outcome(
                         embedding=embedding,
                         target_id="elmer:substrate_input",
                         success=True,
                         metadata={"process_id": self._process_count},
                     )
+
+                    # Cricket rim: if record_outcome hit a constitutional node,
+                    # escalate to SYMPATHETIC. This is the sole exception to
+                    # Elmer's read-only autonomic rule (CLAUDE.md §2).
+                    if outcome.get("constitutional"):
+                        logger.warning(
+                            "Cricket rim activated — constitutional node %s, "
+                            "escalating to SYMPATHETIC",
+                            outcome.get("node_id"),
+                        )
+                        ng_autonomic.write_state({
+                            "state": "SYMPATHETIC",
+                            "threat_level": "constitutional",
+                            "source": "cricket_rim",
+                            "module": "elmer",
+                            "node_id": outcome.get("node_id"),
+                        })
+
                     eco_result = self._ecosystem.get_context(embedding)
             except Exception as exc:
                 logger.warning("NG ecosystem recording failed: %s", exc)
@@ -261,3 +300,30 @@ class ElmerEngine:
                 "identity": self._identity.stats(),
             },
         }
+
+    # -----------------------------------------------------------------
+    # Cricket Rim
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _load_constitutional_embeddings() -> List[Dict[str, Any]]:
+        """Load constitutional embeddings from data/constitutional_embeddings.json.
+
+        Returns the embeddings list for passing to NGLite via config.
+        Returns empty list if file not found (module runs without rim —
+        constitutional enforcement degrades gracefully).
+        """
+        paths = [
+            os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                         "data", "constitutional_embeddings.json"),
+        ]
+        for path in paths:
+            if os.path.exists(path):
+                try:
+                    with open(path) as f:
+                        data = json.load(f)
+                    return data.get("embeddings", [])
+                except Exception as exc:
+                    logger.warning("Failed to load constitutional embeddings from %s: %s", path, exc)
+        logger.info("No constitutional embeddings found — Cricket rim inactive")
+        return []

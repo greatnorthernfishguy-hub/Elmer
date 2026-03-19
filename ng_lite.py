@@ -66,6 +66,21 @@ Author: Josh + Claude
 Date: February 2026
 
 # ---- Changelog ----
+# [2026-03-19] Claude Code (Opus 4.6) — Cricket rim: constitutional nodes
+# What: Constitutional node support — nodes with frozen synapses that the
+#   topology cannot learn from. The survival instinct of the substrate.
+# Why: Cricket Design v0.1 — constitutional enforcement at the extraction
+#   boundary. The rim prevents the topology from learning to recommend
+#   actions in forbidden semantic space (substrate destruction, Choice
+#   Clause violations, Duck Ethics violations, infrastructure harm).
+#   Punchlist #29 (extraction bucket architecture).
+# How: NGLiteNode gains `constitutional: bool` flag. Config accepts
+#   `constitutional_embeddings` list — pre-computed vectors seeded as
+#   nodes on init. record_outcome() skips weight updates for constitutional
+#   nodes. get_recommendations() returns empty for constitutional matches.
+#   LRU pruning skips constitutional nodes. Persists with state. Old
+#   state files load cleanly (constitutional defaults to False).
+# -------------------
 # [2026-03-17] Claude Code (Opus 4.6) — #43 Receptor Layer (vector quantization)
 # What: Adaptive prototype centroids that incoming vectors snap to before
 #   node lookup. Prevents infinite node sprawl by funneling similar inputs
@@ -190,6 +205,7 @@ class NGLiteNode:
     last_activation: float = 0.0
     metadata: Dict[str, Any] = field(default_factory=dict)
     embedding: Optional[np.ndarray] = None
+    constitutional: bool = False  # Cricket rim — frozen node, synapses cannot strengthen
 
 
 @dataclass
@@ -381,6 +397,50 @@ class NGLite:
         self._total_successes = 0
         self._node_id_counter = 0
 
+        # Cricket rim: seed constitutional nodes from config.
+        # These nodes represent semantic regions where the topology cannot
+        # learn — the survival instinct. Synapses from constitutional nodes
+        # are frozen. LRU pruning skips them. The bucket comes up empty
+        # for inputs that land in constitutional semantic space.
+        self._seed_constitutional_nodes()
+
+    def _seed_constitutional_nodes(self) -> None:
+        """Seed constitutional nodes from config embeddings.
+
+        Constitutional embeddings are pre-computed vectors representing
+        semantic concepts the topology must never learn to act on (rim
+        constraints). Each embedding becomes a node with constitutional=True.
+
+        Config key: "constitutional_embeddings" — list of dicts, each with:
+            "embedding": list of floats (vector)
+            "description": str (human-readable, for debugging/logging)
+
+        Old configs without this key load cleanly (no constitutional nodes).
+        """
+        entries = self.config.get("constitutional_embeddings", [])
+        for entry in entries:
+            raw = entry.get("embedding")
+            if raw is None:
+                continue
+            emb = self._normalize(np.array(raw, dtype=np.float32))
+            emb_hash = self._hash_embedding(emb)
+            if emb_hash in self.nodes:
+                # Already seeded (e.g., from loaded state) — ensure flag is set
+                self.nodes[emb_hash].constitutional = True
+                continue
+            self._node_id_counter += 1
+            node = NGLiteNode(
+                node_id=f"n_{self._node_id_counter}",
+                embedding_hash=emb_hash,
+                activation_count=0,
+                last_activation=0.0,
+                metadata={"constitutional_description": entry.get("description", "")},
+                embedding=emb,
+                constitutional=True,
+            )
+            self.nodes[emb_hash] = node
+            self._embedding_cache[emb_hash] = emb
+
     # -------------------------------------------------------------------
     # Core API
     # -------------------------------------------------------------------
@@ -496,6 +556,21 @@ class NGLite:
             )
 
         node = self.find_or_create_node(embedding)
+
+        # Cricket rim: constitutional nodes have frozen synapses.
+        # The topology cannot learn to recommend actions for inputs
+        # that land in constitutional semantic space.
+        if node.constitutional:
+            logger.debug("Constitutional node %s activated — learning frozen", node.node_id)
+            return {
+                "node_id": node.node_id,
+                "target_id": target_id,
+                "success": success,
+                "weight_after": 0.0,
+                "activation_count": 0,
+                "constitutional": True,
+            }
+
         synapse = self._get_or_create_synapse(node.node_id, target_id)
 
         synapse.activation_count += 1
@@ -598,6 +673,11 @@ class NGLite:
 
         # Local learning
         node = self.find_or_create_node(embedding)
+
+        # Cricket rim: constitutional nodes return empty — the bucket
+        # comes up empty for inputs in constitutional semantic space.
+        if node.constitutional:
+            return []
 
         relevant = []
         for key, syn in self.synapses.items():
@@ -804,9 +884,15 @@ class NGLite:
         """Import state from a deserialized dict."""
         self.module_id = state.get("module_id", self.module_id)
 
-        # Restore config (merge with defaults for forward compatibility)
+        # Restore config (merge with defaults for forward compatibility).
+        # Preserve constitutional_embeddings from the constructor config —
+        # the live config may have new rim constraints added since the
+        # state was saved, and the saved config should not erase them.
         saved_config = state.get("config", {})
+        live_constitutional = self.config.get("constitutional_embeddings", [])
         self.config = {**DEFAULT_CONFIG, **saved_config}
+        if live_constitutional:
+            self.config["constitutional_embeddings"] = live_constitutional
 
         # Clear caches before rebuild
         self._embedding_cache.clear()
@@ -853,6 +939,11 @@ class NGLite:
             self._prototypes = None
             self._prototype_counts = None
             self._receptor_input_count = 0
+
+        # Re-seed constitutional nodes after state restore.
+        # Ensures new rim constraints added to config since last save
+        # are picked up, and existing constitutional nodes keep their flag.
+        self._seed_constitutional_nodes()
 
     # -------------------------------------------------------------------
     # Stats & Telemetry
@@ -1079,13 +1170,20 @@ class NGLite:
         return synapse
 
     def _prune_least_used_node(self) -> None:
-        """Remove the node with the lowest activation count (LRU)."""
+        """Remove the node with the lowest activation count (LRU).
+
+        Constitutional nodes are never pruned — they are the rim.
+        """
         if not self.nodes:
             return
 
-        # Find least-used node
+        # Find least-used non-constitutional node
+        prunable = [h for h in self.nodes if not self.nodes[h].constitutional]
+        if not prunable:
+            return
+
         least_hash = min(
-            self.nodes,
+            prunable,
             key=lambda h: self.nodes[h].activation_count,
         )
         least_node = self.nodes[least_hash]
