@@ -29,7 +29,7 @@ Elmer is part of the **Triad** (Immunis, Elmer, THC). The Triad forms a closed-l
 
 They do not coordinate directly. The River flows. The topology reshapes itself.
 
-**Status: Built, not integrated.** Vendored files synced to NeuroGraph canonical (2026-03-18). Code is architecturally compliant. Not yet running as a service on the VPS.
+**Status: Integrated (Tier 2, peer bridge).** v0.2.0. Vendored files synced to NeuroGraph canonical (2026-03-19, includes Cricket rim). Registered in `~/.et_modules/`. Not yet running as a persistent service on the VPS.
 
 ---
 
@@ -59,15 +59,22 @@ They do not coordinate directly. The River flows. The topology reshapes itself.
 │   ├── engine.py                  # ElmerEngine — orchestrates sockets + pipelines
 │   ├── graph_encoder.py           # SubstrateSignal → graph-compatible encoding
 │   └── signal_decoder.py          # Graph output → response dict
+├── data/
+│   └── constitutional_embeddings.json  # Cricket rim — 22 embeddings, 4 categories (read-only after init)
+├── surgery/                       # Neural socket training (not core runtime)
+│   ├── train.py, train_on_syl.py, extract_features.py, graph_io.py
+│   └── elmer_brain_v0.1.pt       # Optional neural socket backbone
 ├── ng_lite.py                     # VENDORED — canonical from NeuroGraph
-├── ng_peer_bridge.py              # VENDORED — canonical from NeuroGraph
+├── ng_peer_bridge.py              # VENDORED — canonical from NeuroGraph (legacy, retained until v1.0)
+├── ng_tract_bridge.py             # VENDORED — canonical from NeuroGraph (v0.3+, preferred)
 ├── ng_ecosystem.py                # VENDORED — canonical from NeuroGraph
 ├── ng_autonomic.py                # VENDORED — canonical from NeuroGraph
 ├── openclaw_adapter.py            # VENDORED — canonical from NeuroGraph
+├── ng_updater.py                  # VENDORED — auto-update + vendored file sync (runs on startup)
 ├── et_modules/                    # ET Module Manager integration
 │   ├── __init__.py
 │   └── manager.py
-└── tests/                         # Test suite
+└── tests/                         # Test suite (70 tests)
     ├── test_config.py
     ├── test_hook.py
     ├── test_pipelines.py
@@ -151,15 +158,17 @@ Sockets are managed by `SocketManager` and registered in `et_module.json`. Both 
 
 ## 6. Vendored Files
 
-All five vendored files synced to NeuroGraph canonical on 2026-03-18:
+Seven vendored files synced to NeuroGraph canonical:
 
-| File | Location | Purpose |
-|------|----------|---------|
-| `ng_lite.py` | Repo root | Tier 1 learning substrate |
-| `ng_peer_bridge.py` | Repo root | Tier 2 cross-module learning |
-| `ng_ecosystem.py` | Repo root | Tier management lifecycle |
-| `ng_autonomic.py` | Repo root | Autonomic state (READ ONLY for Elmer) |
-| `openclaw_adapter.py` | Repo root | OpenClaw skill base class |
+| File | Purpose | Last Synced |
+|------|---------|-------------|
+| `ng_lite.py` | Tier 1 learning substrate (includes Cricket rim) | 2026-03-19 |
+| `ng_peer_bridge.py` | Tier 2 legacy fallback (JSONL-based) | 2026-03-18 |
+| `ng_tract_bridge.py` | Tier 2 preferred (per-pair directional tracts, v0.3+) | 2026-03-19 |
+| `ng_ecosystem.py` | Tier management lifecycle | 2026-03-18 |
+| `ng_autonomic.py` | Autonomic state (**READ ONLY for Elmer**, except Cricket rim) | 2026-03-18 |
+| `openclaw_adapter.py` | OpenClaw skill base class | 2026-02-22 |
+| `ng_updater.py` | Auto-update + vendored file sync (runs on startup before imports) | 2026-03-19 |
 
 **Do not modify vendored files.** If Elmer needs different behavior, that behavior lives in Elmer-specific code (`core/`, `pipelines/`, `runtime/`), not in vendored files.
 
@@ -178,11 +187,27 @@ When Elmer detects something outside its domain, it records to the substrate and
 
 ## 8. Graph Encoder Embedding
 
-`runtime/graph_encoder.py` currently uses SHA256 hash-based deterministic embedding as a fallback. The comment acknowledges this: `"Production: replace with sentence-transformers or Ollama."` This is not a bug — it's a bootstrap placeholder. The ecosystem standard embedding model is `all-MiniLM-L6-v2` via `fastembed` (ONNX Runtime).
+`runtime/graph_encoder.py` currently uses SHA256 hash-based deterministic embedding as a fallback. The comment acknowledges this: `"Production: replace with fastembed or Ollama."` This is not a bug — it's a bootstrap placeholder. The ecosystem standard embedding is `ng_embed.py` (`Snowflake/snowflake-arctic-embed-m-v1.5`, 768-dim, ONNX Runtime).
 
 ---
 
-## 9. What Claude Code May and May Not Do
+## 9. Historical Failure Modes — Learn From These
+
+### SubstrateSignal Law 2 Violation (2026-03-18)
+`SubstrateSignal` and `COHERENCE_*` thresholds were initially in vendored `ng_ecosystem.py`. This prevented syncing vendored files without Elmer-specific code leaking into the canonical source. **Fixed:** Extracted to `core/substrate_signal.py` (Elmer-local, not vendored). This is the correct pattern — module-specific behavior lives in module code, not vendored files.
+
+### Autonomic Read/Write Confusion (2026-03-19)
+Both `elmer_hook.py` and `runtime/engine.py` were separately trying to manage autonomic state. **Fixed:** Single integration point, both use `ng_autonomic.read_state()` (read-only). The Cricket rim write path is mechanically isolated in `runtime/engine.py`.
+
+### Missing `_embed()` Override (2026-03-19)
+`OpenClawAdapter` requires `_embed()` but it was missing from `ElmerHook`. **Fixed:** Now delegates to `ng_embed.py` (centralized ecosystem embedding) with hash fallback.
+
+### Embedding Dimension Incident (ecosystem-wide, 2026-03-19)
+A CC instance switched NeuroGraph from 768-dim to 384-dim without checking stored vectors, breaking Syl's query layer. **Resolved:** All modules now use `ng_embed.py` (vendored, `Snowflake/snowflake-arctic-embed-m-v1.5`, 768-dim). Embedding model is centralized — no per-module model references. Do not change the model without verifying dimension compatibility with stored vectors.
+
+---
+
+## 10. What Claude Code May and May Not Do
 
 ### Without Josh's Approval
 
@@ -194,15 +219,17 @@ When Elmer detects something outside its domain, it records to the substrate and
 - Update documentation
 
 **Not permitted without explicit Josh approval:**
-- Modify any vendored file
+- Modify any vendored file (including ng_updater.py)
 - Delete any file
-- Add autonomic write capability
+- Add autonomic write capability (except Cricket rim, which already exists)
 - Restart any service
 - Change the pipeline processing order
+- Modify `data/constitutional_embeddings.json`
+- Change the embedding model or dimension
 
 ---
 
-## 10. Environment and Paths
+## 11. Environment and Paths
 
 | What | Where |
 |------|-------|
@@ -212,10 +239,11 @@ When Elmer detects something outside its domain, it records to the substrate and
 | Module data (runtime) | `~/.et_modules/elmer/` |
 | Shared learning JSONL | `~/.et_modules/shared_learning/elmer.jsonl` |
 | Peer registry | `~/.et_modules/shared_learning/_peer_registry.json` |
+| Tract files (Tier 2) | `~/.et_modules/tracts/elmer/` |
 
 ---
 
 *E-T Systems / Elmer*
-*Last updated: 2026-03-18*
+*Last updated: 2026-03-21*
 *Maintained by Josh — do not edit without authorization*
 *Parent documents: `~/.claude/CLAUDE.md` (global), `~/.claude/ARCHITECTURE.md`*
