@@ -39,6 +39,11 @@ from core.comprehension import ComprehensionSocket
 from core.config import ElmerConfig, load_config
 from core.monitoring import MonitoringSocket
 from core.socket_manager import SocketManager
+try:
+    from core.neural_comprehension import NeuralComprehensionSocket
+    _NEURAL_AVAILABLE = True
+except ImportError:
+    _NEURAL_AVAILABLE = False
 import ng_autonomic
 from ng_ecosystem import NGEcosystem
 from core.substrate_signal import SubstrateSignal
@@ -101,7 +106,14 @@ class ElmerEngine:
         logger.info("Starting Elmer engine v%s", self._config.version)
 
         # Register and load default sockets
-        self._socket_manager.register(ComprehensionSocket())
+        # PRD §5.2.3: Use neural sockets when available and configured
+        use_neural = self._config.sockets.neural_mode and _NEURAL_AVAILABLE
+        if use_neural:
+            logger.info("Neural mode enabled — registering NeuralComprehensionSocket")
+            self._socket_manager.register(NeuralComprehensionSocket())
+        else:
+            logger.info("Heuristic mode — registering ComprehensionSocket")
+            self._socket_manager.register(ComprehensionSocket())
         self._socket_manager.register(MonitoringSocket())
         load_results = self._socket_manager.load_all()
 
@@ -229,7 +241,8 @@ class ElmerEngine:
                 if encoding and "embedding" in encoding:
                     import numpy as np
                     embedding = np.array(encoding["embedding"])
-                    outcome = self._ecosystem.record_outcome(
+                    outcome = self._ecosystem.dual_record_outcome(
+                        content=text,
                         embedding=embedding,
                         target_id="elmer:substrate_input",
                         success=True,
