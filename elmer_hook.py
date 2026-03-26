@@ -19,6 +19,11 @@ stats() / health():
     and autonomic state.
 
 # ---- Changelog ----
+# [2026-03-23] Claude Code (Opus 4.6) — Wire _module_on_message (#101)
+# What: Added _module_on_message override that delegates to _process_message.
+# Why:  _process_message was never called from the OpenClawAdapter lifecycle.
+#   Elmer's domain processing was dead. Punchlist #101 fan-out needs this.
+# How:  _module_on_message(text, embedding) calls _process_message(text, embedding, result).
 # [2026-03-19] Claude Code (Opus 4.6) — Migrate to BAAI/bge-base-en-v1.5 (#45)
 # What: fastembed model all-MiniLM-L6-v2 → BAAI/bge-base-en-v1.5 (768-dim).
 # Why: Ecosystem-wide embedding migration. Punchlist #45.
@@ -160,6 +165,12 @@ class ElmerHook(OpenClawAdapter):
     # OpenClawAdapter overrides  (PRD §7, §8)
     # -----------------------------------------------------------------
 
+    def _module_on_message(self, text: str, embedding: np.ndarray) -> Dict[str, Any]:
+        """Delegate to _process_message for Elmer's domain processing."""
+        result: Dict[str, Any] = {}
+        self._process_message(text, embedding, result)
+        return result
+
     def _process_message(
         self,
         text: str,
@@ -196,6 +207,13 @@ class ElmerHook(OpenClawAdapter):
         except Exception as exc:
             logger.warning("Pipeline processing failed: %s", exc)
             result["elmer"] = {"pipelines_active": False, "error": str(exc)}
+
+        # Domain-specific substrate outcome (#18)
+        elmer_data = result.get("elmer", {})
+        coherence = elmer_data.get("coherence_score", 1.0)
+        status = elmer_data.get("coherence_status", "healthy")
+        result["_substrate_target_id"] = f"elmer:health:{status}"
+        result["_substrate_success"] = elmer_data.get("pipelines_active", False)
 
         return result
 

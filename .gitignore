@@ -9,3 +9,5 @@ build/
 .env
 .venv/
 venv/
+*.pt
+models/

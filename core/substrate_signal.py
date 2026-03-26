@@ -40,7 +40,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional
 
 
-# Threshold constants (PRD §14)
+# Threshold constants (PRD §14) — bootstrap defaults.
+# SVG Phase 3: config-backed via CoherenceConfig. These module-level
+# constants are retained as fallbacks and for direct import compatibility.
 COHERENCE_HEALTHY: float = 0.70
 COHERENCE_DEGRADED: float = 0.40
 COHERENCE_CRITICAL: float = 0.15

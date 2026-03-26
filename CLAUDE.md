@@ -48,6 +48,7 @@ They do not coordinate directly. The River flows. The topology reshapes itself.
 │   ├── base_socket.py             # Socket ABC for processing units
 │   ├── comprehension.py           # ComprehensionSocket — graph topology analysis
 │   ├── monitoring.py              # MonitoringSocket — health dashboard
+│   ├── myelination.py             # MyelinationSocket — oligodendrocyte (v0.4, tract myelination decisions)
 │   └── socket_manager.py          # Socket lifecycle management
 ├── pipelines/                     # Five-stage processing pipeline
 │   ├── sensory.py                 # Raw text → observation SubstrateSignal
@@ -151,8 +152,9 @@ Elmer uses a socket architecture for processing units:
 |--------|---------|-------------|
 | `ComprehensionSocket` | Graph topology analysis | No |
 | `MonitoringSocket` | Health monitoring dashboard | No |
+| `MyelinationSocket` | Oligodendrocyte — decides which tracts to myelinate | No |
 
-Sockets are managed by `SocketManager` and registered in `et_module.json`. Both are stub implementations in the current version — base class interface is defined, full implementations are future work.
+Sockets are managed by `SocketManager` and registered in `runtime/engine.py:start()`. `MyelinationSocket` (v0.4, 2026-03-23) extracts pathway activity patterns from the substrate and produces myelination recommendations. Apprentice-tier heuristic counts peer events from the bridge cache. Engine applies recommendations to Elmer's own tract bridge via `myelinate_tract()`/`demyelinate_tract()`. Tracts stay dumb — myelination state is runtime-only.
 
 ---
 

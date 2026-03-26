@@ -6,6 +6,40 @@ and the autonomic monitor.  Receives raw input, builds GraphSnapshots,
 routes through sockets, chains pipelines, and returns SocketOutputs.
 
 # ---- Changelog ----
+# [2026-03-25] Claude Code (Opus 4.6) — Dynamic brain switching
+# What: BrainSwitcher dynamically swaps between frozen ElmerBrain and
+#   living ProtoUniBrain based on VPS resource availability.
+# Why: Can't run both brains simultaneously (16GB VPS). Dynamic switching
+#   lets ProtoUniBrain wake up when resources allow, fall back to
+#   ElmerBrain when the VPS is busy. User activity resets idle timer.
+# How: BrainSwitcher monitors RAM/CPU/idle in a background thread.
+#   Starts with ElmerBrain (safe). Upgrades to ProtoUniBrain when:
+#   RAM > 6.5GB free, CPU load < 2.0, idle > 120s. Downgrades when
+#   resources tighten or user becomes active. 5-min cooldown between
+#   switches. Integrated into process_text (notify_input), stop(),
+#   and health() for full lifecycle management.
+# [2026-03-24] Claude Code (Opus 4.6) — TuningSocket wiring (homeostasis audit)
+# What: Register TuningSocket in start(), wire NGLite ref, apply tuning
+#   recommendations in process_text() after socket routing.
+# Why: Elmer was observation-only for substrate health. The 2026-03-23 tuning
+#   (zero firing in 1,931 steps) was manual. TuningSocket closes the loop —
+#   Elmer can now adjust substrate parameters (success_boost, failure_penalty,
+#   novelty_threshold, pruning_threshold, receptor params) via NGLite's
+#   validated update_tunable() API.
+# How: TuningSocket registered alongside Comprehension + Monitoring + Myelination.
+#   NGLite ref set after ecosystem init. _apply_tuning() reads socket outputs
+#   for tuning recommendations and calls ng_lite.update_tunable(). Pattern B
+#   feedback via pending health comparison on subsequent cycles.
+# [2026-03-23] Claude (Opus 4.6) — MyelinationSocket wiring (punchlist #53 v0.4)
+# What: Register MyelinationSocket in start(), wire bridge ref, apply
+#   myelination recommendations in process_text() after socket routing.
+# Why: Elmer is the oligodendrocyte — decides which tracts get myelinated.
+#   MyelinationSocket extracts pathway patterns, engine applies decisions.
+# How: MyelinationSocket registered alongside Comprehension + Monitoring.
+#   Bridge ref set after ecosystem init. _apply_myelination() reads
+#   socket outputs for myelination recommendations and calls
+#   myelinate_tract()/demyelinate_tract() on Elmer's own peer bridge.
+# -------------------
 # [2026-03-19] Claude Code (Opus 4.6) — Cricket rim integration
 # What: Load constitutional embeddings and pass to NGEcosystem/NGLite
 #   on init. Elmer's extraction bucket now enforces the rim —
@@ -37,13 +71,21 @@ from typing import Any, Dict, List, Optional
 from core.base_socket import GraphSnapshot, SocketOutput
 from core.comprehension import ComprehensionSocket
 from core.config import ElmerConfig, load_config
+from core.myelination import MyelinationSocket
 from core.monitoring import MonitoringSocket
+from core.tuning import TuningSocket
 from core.socket_manager import SocketManager
 try:
     from core.neural_comprehension import NeuralComprehensionSocket
     _NEURAL_AVAILABLE = True
 except ImportError:
     _NEURAL_AVAILABLE = False
+try:
+    from core.brain_socket import BrainSocket
+    from core.proto_brain_socket import ProtoUniBrainSocket
+    _BRAIN_AVAILABLE = True
+except ImportError:
+    _BRAIN_AVAILABLE = False
 import ng_autonomic
 from ng_ecosystem import NGEcosystem
 from core.substrate_signal import SubstrateSignal
@@ -115,6 +157,24 @@ class ElmerEngine:
             logger.info("Heuristic mode — registering ComprehensionSocket")
             self._socket_manager.register(ComprehensionSocket())
         self._socket_manager.register(MonitoringSocket())
+        self._myelination_socket = MyelinationSocket()
+        self._socket_manager.register(self._myelination_socket)
+        self._tuning_socket = TuningSocket()
+        self._socket_manager.register(self._tuning_socket)
+        # UniAI brain switcher — dynamically swaps between frozen ElmerBrain
+        # and living ProtoUniBrain based on resource availability
+        self._brain_switcher = None
+        if _BRAIN_AVAILABLE:
+            try:
+                from core.brain_switcher import BrainSwitcher
+                self._brain_switcher = BrainSwitcher(self._socket_manager)
+                self._brain_switcher.start()
+                logger.info("BrainSwitcher started (ElmerBrain active, "
+                            "ProtoUniBrain on standby)")
+            except Exception as exc:
+                logger.warning("BrainSwitcher init failed: %s", exc)
+        else:
+            logger.info("Brain sockets not available (torch/transformers not installed)")
         load_results = self._socket_manager.load_all()
 
         # Initialize NG ecosystem with Cricket rim (constitutional embeddings)
@@ -142,6 +202,14 @@ class ElmerEngine:
                 },
             )
             eco_tier = self._ecosystem.tier
+            # Wire MyelinationSocket to Elmer's own peer bridge for event counts
+            if hasattr(self._ecosystem, '_peer_bridge') and self._ecosystem._peer_bridge:
+                self._myelination_socket.set_bridge_ref(self._ecosystem._peer_bridge)
+                logger.info("MyelinationSocket wired to peer bridge")
+            # Wire TuningSocket to Elmer's local NGLite for parameter adjustment
+            if hasattr(self._ecosystem, '_graph') and self._ecosystem._graph:
+                self._tuning_socket.set_ng_lite_ref(self._ecosystem._graph)
+                logger.info("TuningSocket wired to NGLite substrate")
         except Exception as exc:
             logger.warning("NG ecosystem init failed (standalone): %s", exc)
             self._ecosystem = None
@@ -166,6 +234,8 @@ class ElmerEngine:
             return
 
         logger.info("Stopping Elmer engine...")
+        if self._brain_switcher:
+            self._brain_switcher.stop()
         self._socket_manager.unload_all()
 
         if self._ecosystem:
@@ -204,6 +274,10 @@ class ElmerEngine:
 
         self._process_count += 1
 
+        # Notify brain switcher of user activity
+        if self._brain_switcher:
+            self._brain_switcher.notify_input()
+
         # Read autonomic state  (PRD §7)
         autonomic = ng_autonomic.read_state()
         context = {
@@ -220,6 +294,12 @@ class ElmerEngine:
 
         # 3. Route through sockets  (PRD §5.2)
         socket_outputs = self._socket_manager.route(snapshot, context)
+
+        # 3b. Apply myelination recommendations from MyelinationSocket
+        self._apply_myelination(socket_outputs)
+
+        # 3c. Apply tuning recommendations from TuningSocket
+        self._apply_tuning(socket_outputs)
 
         # 4. Inference pipeline on first socket output  (PRD §8)
         if socket_outputs:
@@ -284,6 +364,93 @@ class ElmerEngine:
         return result
 
     # -----------------------------------------------------------------
+    # Myelination  (punchlist #53 v0.4)
+    # -----------------------------------------------------------------
+
+    def _apply_myelination(self, socket_outputs: List[SocketOutput]) -> None:
+        """Apply myelination recommendations from the MyelinationSocket.
+
+        Reads the MyelinationSocket's output and calls myelinate/demyelinate
+        on Elmer's own peer bridge.  This is Elmer managing its own tracts —
+        not reaching into another module's bridge (Law 1 compliant).
+        """
+        if not self._ecosystem or not hasattr(self._ecosystem, '_peer_bridge'):
+            return
+        bridge = self._ecosystem._peer_bridge
+        if bridge is None or not hasattr(bridge, 'myelinate_tract'):
+            return
+
+        for output in socket_outputs:
+            meta = output.signal.metadata
+            if meta.get("socket") != "elmer:myelination":
+                continue
+
+            recs = meta.get("myelination_recommendations", {})
+
+            for peer_id in recs.get("myelinate", []):
+                if not bridge.is_myelinated(peer_id):
+                    if bridge.myelinate_tract(peer_id):
+                        logger.info("Myelination: upgraded tract →%s", peer_id)
+
+            for peer_id in recs.get("demyelinate", []):
+                if bridge.is_myelinated(peer_id):
+                    if bridge.demyelinate_tract(peer_id):
+                        logger.info("Myelination: downgraded tract →%s", peer_id)
+
+    # -----------------------------------------------------------------
+    # Tuning  (Phase 4 — Elmer outward)
+    # -----------------------------------------------------------------
+
+    def _apply_tuning(self, socket_outputs: List[SocketOutput]) -> None:
+        """Apply tuning recommendations from the TuningSocket.
+
+        Reads the TuningSocket's output, applies parameter adjustments via
+        NGLite.update_tunable(), and records outcomes back to the substrate
+        for Pattern B learning.
+        """
+        if not self._ecosystem or not hasattr(self._ecosystem, '_graph'):
+            return
+        ng_lite = self._ecosystem._graph
+        if ng_lite is None or not hasattr(ng_lite, 'update_tunable'):
+            return
+
+        for output in socket_outputs:
+            meta = output.signal.metadata
+            if meta.get("socket") != "elmer:tuning":
+                continue
+            if meta.get("frozen"):
+                continue
+
+            recs = meta.get("tuning_recommendations", [])
+            health_before = meta.get("health_snapshot", {}).get("overall_health", 1.0)
+
+            for rec in recs:
+                key = rec["key"]
+                proposed = rec["proposed"]
+                try:
+                    result = ng_lite.update_tunable(key, proposed)
+                    logger.info(
+                        "Tuning applied: %s %.6f → %.6f (%s)",
+                        key, result["old_value"], result["new_value"],
+                        rec["reason"],
+                    )
+
+                    # Record pending outcome for competence feedback.
+                    # Health_after comes on the next cycle — the socket
+                    # resolves it automatically via _resolve_pending_outcomes().
+                    self._tuning_socket.record_pending_outcome(
+                        key=key,
+                        old_value=result["old_value"],
+                        new_value=result["new_value"],
+                        health_before=health_before,
+                    )
+
+                except KeyError as exc:
+                    logger.warning("Tuning rejected: %s", exc)
+                except Exception as exc:
+                    logger.error("Tuning error for %s: %s", key, exc)
+
+    # -----------------------------------------------------------------
     # Health  (PRD §14)
     # -----------------------------------------------------------------
 
@@ -296,8 +463,13 @@ class ElmerEngine:
         if self._ecosystem:
             eco_stats = self._ecosystem.stats()
 
+        brain_status = None
+        if self._brain_switcher:
+            brain_status = self._brain_switcher.status()
+
         return {
             "status": "healthy" if self._started else "offline",
+            "brain": brain_status,
             "version": self._config.version,
             "uptime": time.time() - self._start_time if self._started else 0.0,
             "process_count": self._process_count,

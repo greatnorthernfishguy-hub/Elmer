@@ -47,6 +47,7 @@ class SocketsConfig:
     health_check_interval: float = 30.0
     connect_timeout: float = 10.0
     default_priority: int = 5
+    neural_mode: bool = True  # Use trained ElmerBrain in sockets (falls back to heuristic)
 
 
 @dataclass
@@ -58,6 +59,15 @@ class NGEcosystemConfig:
     peer_sync_interval: int = 100
     tier3_upgrade_enabled: bool = True
     tier3_poll_interval: float = 300.0
+
+
+@dataclass
+class CoherenceConfig:
+    """Coherence extraction thresholds — Elmer's bucket shape (PRD §14).
+    SVG Phase 3: bootstrap scaffolding, tunable by TuningSocket."""
+    healthy: float = 0.70
+    degraded: float = 0.40
+    critical: float = 0.15
 
 
 @dataclass
@@ -87,6 +97,7 @@ class ElmerConfig:
     sockets: SocketsConfig = field(default_factory=SocketsConfig)
     ng_ecosystem: NGEcosystemConfig = field(default_factory=NGEcosystemConfig)
     pipelines: PipelinesConfig = field(default_factory=PipelinesConfig)
+    coherence: CoherenceConfig = field(default_factory=CoherenceConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +119,7 @@ def _apply_dict(target_dc: Any, source: Dict[str, Any]) -> None:
     """Apply a plain dict onto a dataclass instance, interpolating env vars."""
     for key, value in source.items():
         if not hasattr(target_dc, key):
-            logger.warning("Unknown config key: %s", key)
+            logger.debug("Unmapped config key: %s (ignored)", key)
             continue
         current = getattr(target_dc, key)
         if isinstance(current, (HardwareConfig, SocketsConfig,
