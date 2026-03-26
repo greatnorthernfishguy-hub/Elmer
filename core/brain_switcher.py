@@ -207,28 +207,49 @@ class BrainSwitcher:
             ok_brain = False
             ok_proto = False
 
+            def _flog(msg):
+                with open("/tmp/elmer_eager.log", "a") as _f:
+                    from datetime import datetime
+                    _f.write(f"[{datetime.now()}] SWITCHER: {msg}\n")
+
+            # Ensure Elmer's install dir is importable — the fan-out's
+            # namespace isolation may have stashed 'core' from sys.modules
+            # by the time this background thread runs.
+            import sys as _sys
+            _elmer_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if _elmer_dir not in _sys.path:
+                _sys.path.insert(0, _elmer_dir)
+
             # Load ElmerBrain (frozen reference) first — lightweight
             try:
                 from core.brain_socket import BrainSocket
                 brain_socket = BrainSocket()
+                _flog(f"BrainSocket created, model_path={brain_socket._model_path}")
                 self._socket_manager.register(brain_socket)
                 ok_brain = brain_socket.load("models/brain")
+                _flog(f"BrainSocket.load() returned {ok_brain}")
                 if not ok_brain:
                     logger.error("ElmerBrain failed to load")
                     self._socket_manager.unregister(brain_socket.socket_id)
             except Exception as exc:
+                import traceback
+                _flog(f"ElmerBrain EXCEPTION: {exc}\n{traceback.format_exc()}")
                 logger.error("ElmerBrain activation failed: %s", exc)
 
             # Load ProtoUniBrain (living, Lenia dynamics)
             try:
                 from core.proto_brain_socket import ProtoUniBrainSocket
                 proto_socket = ProtoUniBrainSocket()
+                _flog(f"ProtoUniBrainSocket created, model_path={proto_socket._model_path}")
                 self._socket_manager.register(proto_socket)
                 ok_proto = proto_socket.load("models/proto_brain")
+                _flog(f"ProtoUniBrainSocket.load() returned {ok_proto}")
                 if not ok_proto:
                     logger.warning("ProtoUniBrain failed to load — ElmerBrain only")
                     self._socket_manager.unregister(proto_socket.socket_id)
             except Exception as exc:
+                import traceback
+                _flog(f"ProtoUniBrain EXCEPTION: {exc}\n{traceback.format_exc()}")
                 logger.warning("ProtoUniBrain activation failed: %s", exc)
 
             if ok_brain and ok_proto:
