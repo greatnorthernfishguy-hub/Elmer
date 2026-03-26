@@ -83,9 +83,15 @@ except ImportError:
 try:
     from core.brain_socket import BrainSocket
     from core.proto_brain_socket import ProtoUniBrainSocket
+    from core.brain_switcher import BrainSwitcher
     _BRAIN_AVAILABLE = True
-except ImportError:
+except Exception as _brain_exc:
     _BRAIN_AVAILABLE = False
+    with open("/tmp/elmer_eager.log", "a") as _f:
+        from datetime import datetime
+        import traceback
+        _f.write(f"[{datetime.now()}] _BRAIN_AVAILABLE=False: {_brain_exc}\n")
+        _f.write(traceback.format_exc() + "\n")
 import ng_autonomic
 from ng_ecosystem import NGEcosystem
 from core.substrate_signal import SubstrateSignal
@@ -166,12 +172,16 @@ class ElmerEngine:
         self._brain_switcher = None
         if _BRAIN_AVAILABLE:
             try:
-                from core.brain_switcher import BrainSwitcher
                 self._brain_switcher = BrainSwitcher(self._socket_manager)
                 self._brain_switcher.start()
                 logger.info("BrainSwitcher started (ElmerBrain active, "
                             "ProtoUniBrain on standby)")
             except Exception as exc:
+                with open("/tmp/elmer_eager.log", "a") as _f:
+                    from datetime import datetime
+                    import traceback
+                    _f.write(f"[{datetime.now()}] BrainSwitcher FAILED: {exc}\n")
+                    _f.write(traceback.format_exc() + "\n")
                 logger.warning("BrainSwitcher init failed: %s", exc)
         else:
             logger.info("Brain sockets not available (torch/transformers not installed)")

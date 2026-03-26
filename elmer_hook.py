@@ -19,6 +19,13 @@ stats() / health():
     and autonomic state.
 
 # ---- Changelog ----
+# [2026-03-26] Claude Code (Opus 4.6) — Eager start + route through engine
+# What: Engine starts in __init__ (brainstem always on). _module_on_message
+#   now delegates to engine.process_text() instead of running parallel pipelines.
+# Why: Brain sockets (frozen ElmerBrain + ProtoUniBrain w/ Lenia) were wired
+#   into the engine but fan-out bypassed it. Proto needs real data + every cycle.
+# How: self.start() in __init__, _module_on_message → engine.process_text().
+#   Legacy _process_message retained for direct OC skill calls.
 # [2026-03-23] Claude Code (Opus 4.6) — Wire _module_on_message (#101)
 # What: Added _module_on_message override that delegates to _process_message.
 # Why:  _process_message was never called from the OpenClawAdapter lifecycle.
@@ -105,6 +112,26 @@ class ElmerHook(OpenClawAdapter):
 
         self._started = False
 
+        # Eager start — Elmer is the brainstem, it should always be on.
+        # Brain sockets load in a background thread because the 1.5B model
+        # takes minutes to load on CPU. The fan-out can't block that long.
+        import threading
+        def _deferred_start():
+            try:
+                with open("/tmp/elmer_eager.log", "a") as _f:
+                    _f.write(f"[{__import__('datetime').datetime.now()}] Eager start beginning (background)...\n")
+                self.start()
+                with open("/tmp/elmer_eager.log", "a") as _f:
+                    _f.write(f"[{__import__('datetime').datetime.now()}] Eager start SUCCEEDED\n")
+            except Exception as exc:
+                with open("/tmp/elmer_eager.log", "a") as _f:
+                    import traceback
+                    _f.write(f"[{__import__('datetime').datetime.now()}] Eager start FAILED: {exc}\n")
+                    _f.write(traceback.format_exc() + "\n")
+                logger.warning("Eager start failed (will retry on first message): %s", exc)
+        t = threading.Thread(target=_deferred_start, name="elmer-eager-start", daemon=True)
+        t.start()
+
     # -----------------------------------------------------------------
     # Singleton
     # -----------------------------------------------------------------
@@ -142,12 +169,18 @@ class ElmerHook(OpenClawAdapter):
     # -----------------------------------------------------------------
 
     def start(self) -> Dict[str, Any]:
-        """Start the Elmer engine and all subsystems."""
+        """Start the Elmer engine and all subsystems.
+
+        Called eagerly from __init__ — Elmer is the brainstem,
+        it should always be on.  Brain sockets (frozen ElmerBrain +
+        living ProtoUniBrain with Lenia dynamics) need every cycle
+        they can get.
+        """
         if self._started:
             return {"status": "already_started"}
         result = self._engine.start()
         self._started = True
-        logger.info("ElmerHook started")
+        logger.info("ElmerHook started (eager — brainstem always on)")
         return result
 
     def stop(self) -> None:
@@ -166,10 +199,40 @@ class ElmerHook(OpenClawAdapter):
     # -----------------------------------------------------------------
 
     def _module_on_message(self, text: str, embedding: np.ndarray) -> Dict[str, Any]:
-        """Delegate to _process_message for Elmer's domain processing."""
-        result: Dict[str, Any] = {}
-        self._process_message(text, embedding, result)
-        return result
+        """Route through the engine — pipelines + sockets + brain sockets.
+
+        The engine runs the full processing chain: sensory → GraphSnapshot →
+        socket routing (including frozen ElmerBrain + living ProtoUniBrain
+        with Lenia dynamics) → inference → memory → identity → ecosystem.
+        """
+        # If engine isn't ready yet (background start still loading),
+        # fall back to lightweight pipeline processing
+        if not self._started:
+            result: Dict[str, Any] = {}
+            self._process_message(text, embedding, result)
+            return result
+
+        try:
+            engine_result = self._engine.process_text(text)
+
+            return {
+                "elmer": {
+                    "pipelines_active": True,
+                    "autonomic_state": engine_result.get("autonomic_state", "PARASYMPATHETIC"),
+                    "process_id": engine_result.get("process_id"),
+                    "socket_outputs": engine_result.get("socket_outputs"),
+                },
+                "_substrate_target_id": "elmer:substrate_input",
+                "_substrate_success": True,
+            }
+
+        except Exception as exc:
+            logger.warning("Engine processing failed: %s", exc)
+            return {
+                "elmer": {"pipelines_active": False, "error": str(exc)},
+                "_substrate_target_id": "elmer:substrate_input",
+                "_substrate_success": False,
+            }
 
     def _process_message(
         self,
@@ -177,22 +240,15 @@ class ElmerHook(OpenClawAdapter):
         embedding: np.ndarray,
         result: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        """Elmer-specific message processing through pipelines.
+        """Legacy pipeline path — retained for direct OpenClaw skill calls.
 
-        Routes: sensory → inference → memory store.
-        Autonomic state modulates processing priority (§7).
+        Fan-out messages now go through _module_on_message → engine.
+        This path is only hit if OpenClaw invokes the skill directly.
         """
         try:
-            # Read autonomic state  (PRD §7 — read only, never write)
             autonomic_state = ng_autonomic.read_state().get("state", "PARASYMPATHETIC")
-
-            # Sensory pipeline → observation signal
             sensory_signal = self._sensory.process(text)
-
-            # Inference pipeline → coherence signal
             inference_signal = self._inference.process(sensory_signal)
-
-            # Memory pipeline → store
             self._memory.store(inference_signal)
 
             result["elmer"] = {
@@ -208,9 +264,7 @@ class ElmerHook(OpenClawAdapter):
             logger.warning("Pipeline processing failed: %s", exc)
             result["elmer"] = {"pipelines_active": False, "error": str(exc)}
 
-        # Domain-specific substrate outcome (#18)
         elmer_data = result.get("elmer", {})
-        coherence = elmer_data.get("coherence_score", 1.0)
         status = elmer_data.get("coherence_status", "healthy")
         result["_substrate_target_id"] = f"elmer:health:{status}"
         result["_substrate_success"] = elmer_data.get("pipelines_active", False)
