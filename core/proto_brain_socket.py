@@ -225,18 +225,18 @@ class ProtoUniBrainSocket(ElmerSocket):
         self._process_count += 1
 
         try:
-            # 1. Read Elmer's own local substrate — what the River deposited
+            # 1. Read Elmer's own substrate + latest topology delta from River
             autonomic = context.get('autonomic_state', 'PARASYMPATHETIC')
             graph = None
-            step_result = None
-            if self._ecosystem and hasattr(self._ecosystem, '_graph'):
-                graph = self._ecosystem._graph
-                step_result = getattr(graph, '_last_step_result', None) if graph else None
+            latest_delta = None
+            if self._ecosystem:
+                graph = getattr(self._ecosystem, '_graph', None)
+                latest_delta = self._drain_latest_delta()
 
-            if graph is not None and step_result is not None and self._brain_v2 is not None:
-                # v2 path — reading Elmer's own substrate, Lenia on full mesh
+            if graph is not None and latest_delta is not None and self._brain_v2 is not None:
+                # v2 path — local substrate + River delta, Lenia on full mesh
                 with _torch.no_grad():
-                    output = self._brain_v2(graph, step_result, autonomic)
+                    output = self._brain_v2(graph, latest_delta, autonomic)
             else:
                 # v1 fallback — flat aggregates from GraphSnapshot
                 substrate_state = self._snapshot_to_substrate(snapshot)
@@ -313,6 +313,29 @@ class ProtoUniBrainSocket(ElmerSocket):
     def set_ecosystem_ref(self, ecosystem):
         """Set reference to Elmer's own ecosystem. Called by engine after init."""
         self._ecosystem = ecosystem
+
+    def _drain_latest_delta(self):
+        """Drain the latest topology delta from Elmer's inbound tract.
+
+        The bucket dips into the River. Full-fidelity hyperedge structure,
+        causal chains, predictions — the only Law-compliant place where
+        Tier 3 structure is visible.
+        """
+        if not self._ecosystem:
+            return None
+        bridge = getattr(self._ecosystem, '_peer_bridge', None)
+        if bridge is None:
+            return None
+        try:
+            entries = bridge.drain()
+            if not entries:
+                return None
+            for entry in reversed(entries):
+                if isinstance(entry, dict) and entry.get('type') == 'topology_delta':
+                    return entry
+            return None
+        except Exception:
+            return None
 
     def health(self) -> SocketHealth:
         h = self._make_health("healthy" if self._loaded else "offline")
