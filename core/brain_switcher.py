@@ -60,9 +60,15 @@ class BrainSwitcher:
         self,
         socket_manager,
         thresholds: ResourceThresholds = None,
+        brain_socket_cls=None,
+        proto_brain_socket_cls=None,
+        ecosystem=None,
     ):
         self._socket_manager = socket_manager
         self._thresholds = thresholds or ResourceThresholds()
+        self._brain_socket_cls = brain_socket_cls
+        self._proto_brain_socket_cls = proto_brain_socket_cls
+        self._ecosystem = ecosystem  # Elmer's own NGEcosystem
         self._active_brain: str = "none"  # "elmer_brain", "proto_unibrain", "none"
         self._last_input_time: float = time.time()
         self._last_switch_time: float = 0.0
@@ -222,8 +228,10 @@ class BrainSwitcher:
 
             # Load ElmerBrain (frozen reference) first — lightweight
             try:
-                from core.brain_socket import BrainSocket
+                BrainSocket = self._brain_socket_cls
                 brain_socket = BrainSocket()
+                if self._ecosystem:
+                    brain_socket.set_ecosystem_ref(self._ecosystem)
                 _flog(f"BrainSocket created, model_path={brain_socket._model_path}")
                 self._socket_manager.register(brain_socket)
                 ok_brain = brain_socket.load("models/brain")
@@ -238,8 +246,10 @@ class BrainSwitcher:
 
             # Load ProtoUniBrain (living, Lenia dynamics)
             try:
-                from core.proto_brain_socket import ProtoUniBrainSocket
+                ProtoUniBrainSocket = self._proto_brain_socket_cls
                 proto_socket = ProtoUniBrainSocket()
+                if self._ecosystem:
+                    proto_socket.set_ecosystem_ref(self._ecosystem)
                 _flog(f"ProtoUniBrainSocket created, model_path={proto_socket._model_path}")
                 self._socket_manager.register(proto_socket)
                 ok_proto = proto_socket.load("models/proto_brain")
@@ -281,8 +291,9 @@ class BrainSwitcher:
         """Restore ProtoUniBrain alongside ElmerBrain."""
         with self._lock:
             try:
-                from core.proto_brain_socket import ProtoUniBrainSocket
-                proto_socket = ProtoUniBrainSocket()
+                proto_socket = self._proto_brain_socket_cls()
+                if self._ecosystem:
+                    proto_socket.set_ecosystem_ref(self._ecosystem)
                 self._socket_manager.register(proto_socket)
                 if proto_socket.load("models/proto_brain"):
                     self._active_brain = "both"

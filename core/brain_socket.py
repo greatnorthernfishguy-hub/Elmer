@@ -10,6 +10,13 @@ ProtoUniBrain (Phase 0) will be a second instance with Lenia dynamics
 on the unfrozen transformer body, running alongside this one.
 
 # ---- Changelog ----
+# [2026-03-28] Claude Code (Opus 4.6) — v2 reads Elmer's own substrate
+#   What: Brain socket reads Elmer's local NG-Lite directly via ecosystem ref.
+#   Why:  The River deposited topology into Elmer's substrate. The encoder
+#         reads what's already here. No context dict pass-through. Law 1.
+#   How:  set_ecosystem_ref() called by engine after init. process() reads
+#         self._ecosystem._graph (Elmer's LOCAL substrate). v1 fallback
+#         if substrate or v2 encoder unavailable.
 # [2026-03-25] Claude Code (Opus 4.6) — Initial implementation
 #   What: BrainSocket wrapping ElmerBrain (~/UniAI/models/elmer_brain_v0.1.pt)
 #   Why:  UniAI Phase 0 — socket-ify the surgically modified transformer
@@ -69,13 +76,15 @@ class BrainSocket(ElmerSocket):
     SubstrateSignal with the 9 standard fields + 3 Elmer extensions.
     """
 
-    def __init__(self, model_path: str = None):
+    def __init__(self, model_path: str = None, ecosystem=None):
         super().__init__()
         self._model_path = model_path or os.path.expanduser(
             "~/UniAI/models/elmer_brain_v0.1.pt"
         )
         self._brain = None
+        self._brain_v2 = None
         self._config = None
+        self._ecosystem = ecosystem  # Elmer's own NGEcosystem — set after engine start
 
     @property
     def socket_id(self) -> str:
@@ -123,6 +132,28 @@ class BrainSocket(ElmerSocket):
             for param in self._brain.parameters():
                 param.requires_grad = False
 
+            # Build v2 brain — same transformer body + decoder, v2 encoder
+            try:
+                import importlib.util
+                v2_spec = importlib.util.spec_from_file_location(
+                    "encoder_v2",
+                    os.path.expanduser("~/UniAI/surgery/encoder_v2.py"),
+                )
+                v2_mod = importlib.util.module_from_spec(v2_spec)
+                v2_spec.loader.exec_module(v2_mod)
+                self._brain_v2 = v2_mod.ElmerBrainV2(
+                    self._brain.transformer_body,
+                    self._brain.decoder,
+                    self._config['hidden_size'],
+                )
+                self._brain_v2.eval()
+                for param in self._brain_v2.parameters():
+                    param.requires_grad = False
+                logger.info("BrainSocket v2 encoder loaded")
+            except Exception as v2_exc:
+                logger.info("BrainSocket v2 not available, v1 only: %s", v2_exc)
+                self._brain_v2 = None
+
             self._loaded = True
             logger.info(
                 "BrainSocket loaded: %s (%d params)",
@@ -143,7 +174,12 @@ class BrainSocket(ElmerSocket):
         logger.info("BrainSocket unloaded")
 
     def process(self, snapshot: GraphSnapshot, context: dict) -> SocketOutput:
-        """Process a GraphSnapshot through ElmerBrain."""
+        """Process through ElmerBrain — v2 encoder if graph available, v1 fallback.
+
+        If context contains 'graph' and 'step_result' (provided by the engine
+        when the ecosystem is initialized), uses the substrate-native v2 encoder
+        that reads live NGLite objects. Otherwise falls back to v1 flat aggregates.
+        """
         if not self._loaded or self._brain is None:
             raise RuntimeError("BrainSocket not loaded")
 
@@ -151,12 +187,24 @@ class BrainSocket(ElmerSocket):
         self._process_count += 1
 
         try:
-            # Extract substrate features from GraphSnapshot
-            substrate_state = self._snapshot_to_substrate(snapshot)
+            autonomic = context.get('autonomic_state', 'PARASYMPATHETIC')
 
-            # Run inference
-            with _torch.no_grad():
-                output = self._brain(substrate_state)
+            # Read Elmer's own local substrate — what the River deposited
+            graph = None
+            step_result = None
+            if self._ecosystem and hasattr(self._ecosystem, '_graph'):
+                graph = self._ecosystem._graph
+                step_result = getattr(graph, '_last_step_result', None) if graph else None
+
+            if graph is not None and step_result is not None and self._brain_v2 is not None:
+                # v2 path — reading Elmer's own substrate directly
+                with _torch.no_grad():
+                    output = self._brain_v2(graph, step_result, autonomic)
+            else:
+                # v1 fallback — flat aggregates from GraphSnapshot
+                substrate_state = self._snapshot_to_substrate(snapshot)
+                with _torch.no_grad():
+                    output = self._brain(substrate_state)
 
             # Map decoder output to SubstrateSignal
             signals = output['signals'][0].tolist()  # unbatch
@@ -217,6 +265,10 @@ class BrainSocket(ElmerSocket):
                 confidence=0.0,
                 processing_time=elapsed,
             )
+
+    def set_ecosystem_ref(self, ecosystem):
+        """Set reference to Elmer's own ecosystem. Called by engine after init."""
+        self._ecosystem = ecosystem
 
     def health(self) -> SocketHealth:
         return self._make_health("healthy" if self._loaded else "offline")

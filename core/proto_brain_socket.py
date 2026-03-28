@@ -9,6 +9,13 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-03-28] Claude Code (Opus 4.6) — v2 reads Elmer's own substrate
+#   What: Proto socket reads Elmer's local NG-Lite directly via ecosystem ref.
+#   Why:  Same as BrainSocket — the River deposited topology here. Read it
+#         directly. No context dict pass-through. Law 1. The encoder is part
+#         of the extraction bucket mesh. It reads the substrate's own organization.
+#   How:  set_ecosystem_ref() wired by engine. process() reads local substrate.
+#         v2 encoder params are UNFROZEN — Lenia evolves the mesh.
 # [2026-03-25] Claude Code (Opus 4.6) — Initial implementation
 #   What: ProtoUniBrain socket with live Lenia dynamics
 #   Why:  The whole point of UniAI — a brain that learns from use
@@ -81,15 +88,17 @@ class ProtoUniBrainSocket(ElmerSocket):
     training signal. Lenia dynamics ARE the learning rule.
     """
 
-    def __init__(self, model_path: str = None):
+    def __init__(self, model_path: str = None, ecosystem=None):
         super().__init__()
         self._model_path = model_path or os.path.expanduser(
-            "~/UniAI/models/elmer_brain_1.5b_v0.1.pt"
+            "~/UniAI/models/elmer_brain_v0.1.pt"
         )
         self._brain = None
+        self._brain_v2 = None
         self._lenia = None
         self._config = None
         self._lenia_steps = 0
+        self._ecosystem = ecosystem
 
     @property
     def socket_id(self) -> str:
@@ -156,6 +165,27 @@ class ProtoUniBrainSocket(ElmerSocket):
             )
             self._lenia.register_hooks()
 
+            # Build v2 brain — same transformer body + decoder, v2 encoder
+            # Encoder params are part of the mesh — Lenia evolves them
+            try:
+                import importlib.util
+                v2_spec = importlib.util.spec_from_file_location(
+                    "encoder_v2",
+                    os.path.expanduser("~/UniAI/surgery/encoder_v2.py"),
+                )
+                v2_mod = importlib.util.module_from_spec(v2_spec)
+                v2_spec.loader.exec_module(v2_mod)
+                self._brain_v2 = v2_mod.ElmerBrainV2(
+                    self._brain.transformer_body,
+                    self._brain.decoder,
+                    self._config['hidden_size'],
+                )
+                # v2 encoder params are UNFROZEN — Lenia evolves the mesh
+                logger.info("ProtoUniBrain v2 encoder loaded (mesh params evolve under Lenia)")
+            except Exception as v2_exc:
+                logger.info("ProtoUniBrain v2 not available, v1 only: %s", v2_exc)
+                self._brain_v2 = None
+
             self._brain.eval()
             self._loaded = True
 
@@ -195,14 +225,25 @@ class ProtoUniBrainSocket(ElmerSocket):
         self._process_count += 1
 
         try:
-            # 1. Convert snapshot to substrate state
-            substrate_state = self._snapshot_to_substrate(snapshot)
+            # 1. Read Elmer's own local substrate — what the River deposited
+            autonomic = context.get('autonomic_state', 'PARASYMPATHETIC')
+            graph = None
+            step_result = None
+            if self._ecosystem and hasattr(self._ecosystem, '_graph'):
+                graph = self._ecosystem._graph
+                step_result = getattr(graph, '_last_step_result', None) if graph else None
 
-            # 2. Forward pass (activations captured by Lenia hooks)
-            with _torch.no_grad():
-                output = self._brain(substrate_state)
+            if graph is not None and step_result is not None and self._brain_v2 is not None:
+                # v2 path — reading Elmer's own substrate, Lenia on full mesh
+                with _torch.no_grad():
+                    output = self._brain_v2(graph, step_result, autonomic)
+            else:
+                # v1 fallback — flat aggregates from GraphSnapshot
+                substrate_state = self._snapshot_to_substrate(snapshot)
+                with _torch.no_grad():
+                    output = self._brain(substrate_state)
 
-            # 3. Lenia dynamics step — THE LEARNING
+            # 2. Lenia dynamics step — THE LEARNING
             lenia_metrics = self._lenia.step()
             self._lenia_steps += 1
 
@@ -268,6 +309,10 @@ class ProtoUniBrainSocket(ElmerSocket):
                 confidence=0.0,
                 processing_time=elapsed,
             )
+
+    def set_ecosystem_ref(self, ecosystem):
+        """Set reference to Elmer's own ecosystem. Called by engine after init."""
+        self._ecosystem = ecosystem
 
     def health(self) -> SocketHealth:
         h = self._make_health("healthy" if self._loaded else "offline")

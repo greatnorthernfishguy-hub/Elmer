@@ -6,6 +6,54 @@ and the autonomic monitor.  Receives raw input, builds GraphSnapshots,
 routes through sockets, chains pipelines, and returns SocketOutputs.
 
 # ---- Changelog ----
+# [2026-03-28] Claude Code (Opus 4.6) — Encoder v2 wiring corrected
+# What: Removed context['graph'] pass-through. Brain sockets read Elmer's
+#   own local NG-Lite directly via ecosystem ref set during start().
+# Why: Passing the central graph through context dicts is a direct object
+#   reference across module boundaries. The brain is part of Elmer.
+#   Elmer reads its own substrate. The River brought the topology here.
+#   The encoder reads what's already present. Law 1 compliant.
+# How: Engine passes ecosystem to BrainSwitcher. BrainSwitcher calls
+#   set_ecosystem_ref() on each socket. Sockets read self._ecosystem._graph.
+# [2026-03-28] Claude Code (Opus 4.6) — Brain buffer + async drain thread
+# What: Brain socket processing decoupled from fan-out via buffer + drain thread.
+#   process_text() drops snapshot into buffer (instant). Background drain thread
+#   picks up latest snapshot at brain's own pace. KISS observes synchronously (cheap).
+# Why: Lenia step (~65s on CPU) blocked the fan-out RPC, exceeding the TS plugin's
+#   30s afterTurn timeout. TS stopped sending afterTurn calls. Pipeline froze.
+#   Buffer/drain pattern: fan-out returns instantly, brains cook in background.
+# How: _drop_to_brain_buffer() replaces synchronous _process_brain_sockets_kissed()
+#   in process_text(). _start_brain_drain() launches persistent thread on brain load.
+#   Thread loops: grab latest snapshot → brain sockets process → sleep if empty.
+#   Only latest snapshot kept — brain reads current state, not history.
+# [2026-03-29] Claude Code (Opus 4.6) — skip_brains parameter for fan-out context
+# What: engine.start(skip_brains=True) skips BrainSwitcher while starting all
+#   lightweight sockets (Comprehension, Monitoring, Myelination, Tuning) + KISS.
+# Why: Fan-out context can't load brain models (OOM). But engine.start() was
+#   being skipped entirely, leaving _started=False and process_text() unreachable.
+#   Now fan-out gets full pipeline + KISS without brains. Brains load standalone.
+# How: skip_brains param gates only the BrainSwitcher block. Everything else runs.
+# [2026-03-27] Claude Code (Opus 4.6) — Set _started before ecosystem init
+# What: Move self._started = True before NGEcosystem.get_instance().
+# Why: In the fan-out background thread, NGEcosystem.get_instance() can hang
+#   on filesystem locks or bridge init contention. With _started gated after
+#   ecosystem init, the engine never reports ready, and every _module_on_message
+#   falls through to the legacy pipeline — brains, KISS, and sockets never run.
+# How: _started set after socket registration, before ecosystem init.
+#   All ecosystem-dependent code in process_text() is already guarded by
+#   `if self._ecosystem:` — graceful at Tier 0/1 without ecosystem.
+#   Ecosystem init still runs — if it succeeds, engine upgrades to Tier 2/3.
+#   If it hangs, engine operates at Tier 0/1 with full socket + KISS capability.
+# [2026-03-26] Claude Code (Opus 4.6) — KISS Phase 1 (NuWave Layer 1)
+# What: KISSFilter integrated into engine. Delta gate + sparse extract
+#   on brain socket input path. Phase 1 is observe-only — logs what
+#   WOULD be filtered without actually skipping brain processing.
+# Why: NuWave compound optimization. Brain sockets cost ~65s per Lenia
+#   step on CPU. Redundant inputs waste that entire cycle. KISS reduces
+#   input so every Lenia step processes meaningful data.
+# How: KISSFilter tracks last snapshot features. Cosine similarity for
+#   delta gate. Sparse diff for change detection. Stats to /tmp/elmer_kiss.log
+#   and health() endpoint. Brain socket path split in Phase 1.1.
 # [2026-03-25] Claude Code (Opus 4.6) — Dynamic brain switching
 # What: BrainSwitcher dynamically swaps between frozen ElmerBrain and
 #   living ProtoUniBrain based on VPS resource availability.
@@ -18,6 +66,11 @@ routes through sockets, chains pipelines, and returns SocketOutputs.
 #   resources tighten or user becomes active. 5-min cooldown between
 #   switches. Integrated into process_text (notify_input), stop(),
 #   and health() for full lifecycle management.
+# [2026-03-26] Claude Code Opus — Punchlist #44: Wire TuningSocket bridge ref
+# What: Wire peer bridge ref to TuningSocket for absorption rate metrics
+# Why: Punchlist #44 — TuningSocket needs bridge stats to compute absorption
+#   rate, which drives relevance_threshold tuning decisions.
+# How: Same wiring pattern as MyelinationSocket.set_bridge_ref().
 # [2026-03-24] Claude Code (Opus 4.6) — TuningSocket wiring (homeostasis audit)
 # What: Register TuningSocket in start(), wire NGLite ref, apply tuning
 #   recommendations in process_text() after socket routing.
@@ -71,6 +124,7 @@ from typing import Any, Dict, List, Optional
 from core.base_socket import GraphSnapshot, SocketOutput
 from core.comprehension import ComprehensionSocket
 from core.config import ElmerConfig, load_config
+from core.kiss import KISSFilter, KISSConfig
 from core.myelination import MyelinationSocket
 from core.monitoring import MonitoringSocket
 from core.tuning import TuningSocket
@@ -121,6 +175,8 @@ class ElmerEngine:
             model_dir="models",
         )
         self._graph_encoder = GraphEncoder()
+        # KISS — input optimization for brain sockets (NuWave Layer 1)
+        self._kiss = KISSFilter()
         self._signal_decoder = SignalDecoder()
         # Autonomic state read via ng_autonomic.read_state() (read-only, PRD §7)
 
@@ -136,14 +192,32 @@ class ElmerEngine:
         self._start_time = 0.0
         self._process_count = 0
 
+        # Brain buffer — process_text() drops snapshots here, the brain
+        # drain thread picks them up at its own pace. Only the latest
+        # snapshot matters (the brain reads current state, not history).
+        # This decouples the fan-out RPC timeout (~30s) from Lenia step
+        # time (~65s+). The fan-out returns instantly. The brain cooks.
+        import threading
+        self._brain_buffer_lock = threading.Lock()
+        self._brain_latest_snapshot = None  # latest GraphSnapshot
+        self._brain_latest_context = None   # latest context dict
+        self._brain_drain_thread = None
+        self._brain_drain_running = False
+
     # -----------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------
 
-    def start(self) -> Dict[str, Any]:
+    def start(self, skip_brains: bool = False) -> Dict[str, Any]:
         """Initialize and start the engine.
 
         Registers default sockets, loads them, and connects NG ecosystem.
+
+        Args:
+            skip_brains: If True, skip BrainSwitcher/BrainSocket/ProtoUniBrainSocket
+                registration. Used in fan-out context where brain models would OOM.
+                Lightweight sockets (Comprehension, Monitoring, Myelination, Tuning)
+                and KISS still run.
 
         Returns:
             Startup report dict.
@@ -151,7 +225,7 @@ class ElmerEngine:
         if self._started:
             return {"status": "already_started"}
 
-        logger.info("Starting Elmer engine v%s", self._config.version)
+        logger.info("Starting Elmer engine v%s (skip_brains=%s)", self._config.version, skip_brains)
 
         # Register and load default sockets
         # PRD §5.2.3: Use neural sockets when available and configured
@@ -168,14 +242,22 @@ class ElmerEngine:
         self._tuning_socket = TuningSocket()
         self._socket_manager.register(self._tuning_socket)
         # UniAI brain switcher — dynamically swaps between frozen ElmerBrain
-        # and living ProtoUniBrain based on resource availability
+        # and living ProtoUniBrain based on resource availability.
+        # Skipped in fan-out context (skip_brains=True) to avoid OOM from
+        # loading two 0.5B transformer models in-process with 7 other modules.
         self._brain_switcher = None
-        if _BRAIN_AVAILABLE:
+        if _BRAIN_AVAILABLE and not skip_brains:
             try:
-                self._brain_switcher = BrainSwitcher(self._socket_manager)
+                self._brain_switcher = BrainSwitcher(
+                    self._socket_manager,
+                    brain_socket_cls=BrainSocket,
+                    proto_brain_socket_cls=ProtoUniBrainSocket,
+                    ecosystem=self._ecosystem,
+                )
                 self._brain_switcher.start()
+                self._start_brain_drain()
                 logger.info("BrainSwitcher started (ElmerBrain active, "
-                            "ProtoUniBrain on standby)")
+                            "ProtoUniBrain on standby, drain thread running)")
             except Exception as exc:
                 with open("/tmp/elmer_eager.log", "a") as _f:
                     from datetime import datetime
@@ -183,12 +265,27 @@ class ElmerEngine:
                     _f.write(f"[{datetime.now()}] BrainSwitcher FAILED: {exc}\n")
                     _f.write(traceback.format_exc() + "\n")
                 logger.warning("BrainSwitcher init failed: %s", exc)
+        elif skip_brains:
+            logger.info("Brain sockets skipped (fan-out context)")
         else:
             logger.info("Brain sockets not available (torch/transformers not installed)")
         load_results = self._socket_manager.load_all()
 
+        # Mark engine as started BEFORE ecosystem init.
+        # Sockets, pipelines, and brain sockets are ready — the engine
+        # can process messages at Tier 0/1. Ecosystem init adds Tier 2/3
+        # connectivity (peer bridge, tract bridge, Cricket rim) but may
+        # hang when run from the fan-out's background thread due to
+        # filesystem locks or bridge initialization contention.
+        # All ecosystem-dependent code in process_text() is already
+        # guarded by `if self._ecosystem:` — safe to proceed without it.
+        self._started = True
+        self._start_time = time.time()
+
         # Initialize NG ecosystem with Cricket rim (constitutional embeddings)
+        # This upgrades the engine from Tier 0 → Tier 2/3 if successful.
         eco_config = self._config.ng_ecosystem
+        eco_tier = 0
         constitutional = self._load_constitutional_embeddings()
         try:
             ng_lite_config: Dict[str, Any] = {}
@@ -220,13 +317,14 @@ class ElmerEngine:
             if hasattr(self._ecosystem, '_graph') and self._ecosystem._graph:
                 self._tuning_socket.set_ng_lite_ref(self._ecosystem._graph)
                 logger.info("TuningSocket wired to NGLite substrate")
+            # Wire TuningSocket to peer bridge for absorption rate (#44)
+            if hasattr(self._ecosystem, '_peer_bridge') and self._ecosystem._peer_bridge:
+                self._tuning_socket.set_bridge_ref(self._ecosystem._peer_bridge)
+                logger.info("TuningSocket wired to peer bridge for absorption metrics")
         except Exception as exc:
             logger.warning("NG ecosystem init failed (standalone): %s", exc)
             self._ecosystem = None
             eco_tier = 0
-
-        self._started = True
-        self._start_time = time.time()
 
         report = {
             "status": "started",
@@ -238,12 +336,40 @@ class ElmerEngine:
         logger.info("Elmer engine started: %s", report)
         return report
 
+    def load_brains(self) -> None:
+        """Load brain sockets into an already-running engine.
+
+        Called after a delay in fan-out context — all other modules have
+        settled, GC has run, there's headroom for the ~1.3GB brain models.
+        The BrainSwitcher registers both sockets with the existing socket
+        manager. Next process_text() call will route to them + Lenia steps.
+        """
+        if not self._started:
+            raise RuntimeError("Engine not started. Call start() first.")
+        if self._brain_switcher:
+            logger.info("Brains already loaded — skipping")
+            return
+        if not _BRAIN_AVAILABLE:
+            logger.warning("Brain classes not available — cannot load")
+            return
+
+        self._brain_switcher = BrainSwitcher(
+            self._socket_manager,
+            brain_socket_cls=BrainSocket,
+            proto_brain_socket_cls=ProtoUniBrainSocket,
+            ecosystem=self._ecosystem,
+        )
+        self._brain_switcher.start()
+        self._start_brain_drain()
+        logger.info("BrainSwitcher loaded (delayed) — both brains active, drain thread running")
+
     def stop(self) -> None:
         """Graceful shutdown."""
         if not self._started:
             return
 
         logger.info("Stopping Elmer engine...")
+        self._stop_brain_drain()
         if self._brain_switcher:
             self._brain_switcher.stop()
         self._socket_manager.unload_all()
@@ -296,6 +422,14 @@ class ElmerEngine:
             "process_id": self._process_count,
         }
 
+        # Provide live substrate objects for v2 encoder (if ecosystem initialized)
+        # The brain sockets use these to read hyperedges, fired nodes, predictions
+        # directly from the live NGLite graph — no serialization boundary.
+        if self._ecosystem:
+            # Brain sockets read Elmer's local substrate directly.
+            # The River deposited topology into Elmer's NG-Lite.
+            # The encoder reads what's already here — no pass-through needed.
+
         # 1. Sensory pipeline  (PRD §8)
         sensory_signal = self._sensory.process(text)
 
@@ -310,6 +444,13 @@ class ElmerEngine:
 
         # 3c. Apply tuning recommendations from TuningSocket
         self._apply_tuning(socket_outputs)
+
+        # 3d. Drop snapshot into brain buffer (NuWave Layer 1)
+        #     Brain sockets are expensive (~65s Lenia step on CPU).
+        #     The brain drain thread picks up the latest snapshot at its
+        #     own pace — no blocking the fan-out RPC. KISS observes here
+        #     (synchronous, cheap), brain processing happens async.
+        self._drop_to_brain_buffer(snapshot, context)
 
         # 4. Inference pipeline on first socket output  (PRD §8)
         if socket_outputs:
@@ -461,6 +602,183 @@ class ElmerEngine:
                     logger.error("Tuning error for %s: %s", key, exc)
 
     # -----------------------------------------------------------------
+    # Brain Buffer — Async Brain Processing (NuWave Layer 1)
+    # -----------------------------------------------------------------
+
+    def _drop_to_brain_buffer(self, snapshot: GraphSnapshot, context: dict) -> None:
+        """Drop snapshot into the brain buffer. Returns instantly.
+
+        The brain drain thread picks up the latest snapshot at its own
+        pace. Only the most recent snapshot is kept — the brain reads
+        current state, not history. This is biologically correct: the
+        brainstem reads the current state of the world when it's ready,
+        not each individual signal as it arrives.
+
+        KISS observation runs here (synchronous, cheap). Brain processing
+        runs on the drain thread (async, expensive).
+        """
+        # KISS observation — synchronous, runs every call
+        self._observe_kiss(snapshot, context)
+
+        # Drop latest snapshot for the brain drain thread
+        with self._brain_buffer_lock:
+            self._brain_latest_snapshot = snapshot
+            self._brain_latest_context = context
+
+    def _start_brain_drain(self) -> None:
+        """Start the background thread that drains the brain buffer.
+
+        Called after brains are loaded. The thread loops: check buffer,
+        if there's a new snapshot, process it through brain sockets
+        (KISS filter + forward pass + Lenia step). Then sleep briefly
+        and check again.
+        """
+        if self._brain_drain_running:
+            return
+
+        import threading
+
+        self._brain_drain_running = True
+
+        def _drain_loop():
+            while self._brain_drain_running:
+                snapshot = None
+                context = None
+
+                # Grab the latest snapshot (if any)
+                with self._brain_buffer_lock:
+                    if self._brain_latest_snapshot is not None:
+                        snapshot = self._brain_latest_snapshot
+                        context = self._brain_latest_context
+                        self._brain_latest_snapshot = None
+                        self._brain_latest_context = None
+
+                if snapshot is not None:
+                    try:
+                        self._process_brain_sockets_kissed(snapshot, context, [])
+                    except Exception as exc:
+                        logger.warning("Brain drain error: %s", exc)
+                else:
+                    # No new data — sleep briefly before checking again
+                    import time
+                    time.sleep(1.0)
+
+        self._brain_drain_thread = threading.Thread(
+            target=_drain_loop,
+            name="elmer-brain-drain",
+            daemon=True,
+        )
+        self._brain_drain_thread.start()
+        logger.info("Brain drain thread started — brains process at their own pace")
+
+    def _stop_brain_drain(self) -> None:
+        """Stop the brain drain thread."""
+        self._brain_drain_running = False
+        if self._brain_drain_thread:
+            self._brain_drain_thread.join(timeout=5)
+            self._brain_drain_thread = None
+
+    def _observe_kiss(self, snapshot: GraphSnapshot, context: dict) -> None:
+        """Run KISS observation on the snapshot. Synchronous, cheap.
+
+        Logs what KISS would filter — runs every process_text() call
+        regardless of whether brains are loaded.
+        """
+        try:
+            import numpy as _np
+            nodes = snapshot.nodes
+            edges = snapshot.edges
+            meta = snapshot.metadata
+
+            if nodes:
+                node_feat = [_np.mean([n.get('voltage', 0.0) for n in nodes]),
+                             _np.mean([n.get('firing_rate', 0.0) for n in nodes]),
+                             _np.mean([n.get('excitability', 0.5) for n in nodes])]
+            else:
+                node_feat = [0.0, 0.0, 0.5]
+
+            if edges:
+                synapse_feat = [_np.mean([e.get('weight', 0.5) for e in edges]),
+                                _np.mean([e.get('age', 0.0) for e in edges])]
+            else:
+                synapse_feat = [0.5, 0.0]
+
+            n_nodes = max(len(nodes), 1)
+            n_edges = len(edges)
+            max_edges = n_nodes * (n_nodes - 1)
+            topo_feat = [n_edges / max_edges if max_edges > 0 else 0.0,
+                         meta.get('clustering_coefficient', 0.0),
+                         min(meta.get('connected_components', 1) / max(n_nodes, 1), 1.0)]
+
+            if nodes:
+                recent = [n.get('recent_firing', 0.0) for n in nodes]
+                stdp = [n.get('stdp_timing', 0.0) for n in nodes]
+                temporal_feat = [_np.mean(recent), _np.std(recent),
+                                 _np.mean(stdp), _np.std(stdp)]
+            else:
+                temporal_feat = [0.0, 0.0, 0.0, 0.0]
+
+            identity = meta.get('identity_embedding', _np.zeros(384))
+
+            features = {
+                'node_features': node_feat,
+                'synapse_features': synapse_feat,
+                'topo_features': topo_feat,
+                'temporal_features': temporal_feat,
+                'identity_embedding': identity,
+            }
+
+            kiss_result = self._kiss.filter(features)
+
+            stats = self._kiss.stats.to_dict()
+            if kiss_result:
+                stats["kiss_mode"] = kiss_result.get("kiss_mode", "full")
+                stats["kiss_meta"] = kiss_result.get("kiss_meta", {})
+            else:
+                stats["kiss_mode"] = "skipped"
+                stats["kiss_meta"] = {"reason": "delta_below_threshold"}
+
+            with open("/tmp/elmer_kiss.log", "a") as f:
+                from datetime import datetime
+                import json
+                f.write(f"[{datetime.now()}] {json.dumps(stats)}\n")
+
+        except Exception as exc:
+            logger.debug("KISS observation failed: %s", exc)
+
+    def _process_brain_sockets_kissed(
+        self,
+        snapshot: GraphSnapshot,
+        context: dict,
+        socket_outputs: List[SocketOutput],
+    ) -> None:
+        """Process snapshot through brain sockets. Called from drain thread.
+
+        Runs the brain sockets (frozen + proto w/ Lenia) on the snapshot.
+        This is the expensive path (~65s per Lenia step on CPU). Runs
+        on the drain thread, not the fan-out thread.
+        """
+        if not self._brain_switcher or self._brain_switcher.active_brain == "none":
+            return
+
+        try:
+            # Route to brain sockets only (not all sockets)
+            for socket_id in ["elmer:brain", "elmer:proto_unibrain"]:
+                sock = self._socket_manager.get_socket(socket_id)
+                if sock and hasattr(sock, 'process'):
+                    try:
+                        output = sock.process(snapshot, context)
+                        logger.info(
+                            "Brain drain: %s processed (%.1fs)",
+                            socket_id,
+                            output.processing_time if hasattr(output, 'processing_time') else 0,
+                        )
+                    except Exception as exc:
+                        logger.warning("Brain drain: %s error: %s", socket_id, exc)
+        except Exception as exc:
+            logger.warning("Brain drain processing error: %s", exc)
+
+    # -----------------------------------------------------------------
     # Health  (PRD §14)
     # -----------------------------------------------------------------
 
@@ -480,6 +798,7 @@ class ElmerEngine:
         return {
             "status": "healthy" if self._started else "offline",
             "brain": brain_status,
+            "kiss": self._kiss.stats.to_dict(),
             "version": self._config.version,
             "uptime": time.time() - self._start_time if self._started else 0.0,
             "process_count": self._process_count,
