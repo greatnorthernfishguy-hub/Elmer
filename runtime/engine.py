@@ -425,10 +425,9 @@ class ElmerEngine:
         # Provide live substrate objects for v2 encoder (if ecosystem initialized)
         # The brain sockets use these to read hyperedges, fired nodes, predictions
         # directly from the live NGLite graph — no serialization boundary.
-        if self._ecosystem:
-            # Brain sockets read Elmer's local substrate directly.
-            # The River deposited topology into Elmer's NG-Lite.
-            # The encoder reads what's already here — no pass-through needed.
+        # Brain sockets read Elmer's local substrate directly via
+        # ecosystem ref. The River deposited topology into Elmer's NG-Lite.
+        # The encoder reads what's already here — no pass-through needed.
 
         # 1. Sensory pipeline  (PRD §8)
         sensory_signal = self._sensory.process(text)
