@@ -272,32 +272,28 @@ class BrainSocket(ElmerSocket):
         self._ecosystem = ecosystem
 
     def _drain_latest_delta(self):
-        """Drain the latest topology delta from Elmer's inbound tract.
+        """Read the latest topology delta from already-drained peer events.
 
-        The bucket dips into the River. The topology delta carries
-        full-fidelity hyperedge structure, causal chains, predictions,
-        salience — everything the Tier 3 SNN produced. This is the
-        only Law-compliant place where that structure is visible.
+        Reads _peer_events on the tract bridge — data that the ecosystem's
+        own drain cycle already absorbed into the local substrate. Same
+        pattern Bunyan uses. Does NOT call bridge.drain() (that would
+        compete with the ecosystem's drain cycle and steal data).
 
-        Returns the most recent delta, or None if the tract is empty.
+        Returns the most recent topology_delta, or None if none available.
         """
         if not self._ecosystem:
             return None
         bridge = getattr(self._ecosystem, '_peer_bridge', None)
         if bridge is None:
             return None
-        try:
-            entries = bridge.drain()
-            if not entries:
-                return None
-            # Return the most recent topology delta
-            for entry in reversed(entries):
-                if isinstance(entry, dict) and entry.get('type') == 'topology_delta':
-                    return entry
-            # No topology deltas in this drain — return None
+        peer_events = getattr(bridge, '_peer_events', [])
+        if not peer_events:
             return None
-        except Exception:
-            return None
+        # Most recent topology delta
+        for entry in reversed(peer_events):
+            if isinstance(entry, dict) and entry.get('type') == 'topology_delta':
+                return entry
+        return None
 
     def health(self) -> SocketHealth:
         return self._make_health("healthy" if self._loaded else "offline")

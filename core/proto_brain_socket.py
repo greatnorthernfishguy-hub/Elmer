@@ -315,27 +315,28 @@ class ProtoUniBrainSocket(ElmerSocket):
         self._ecosystem = ecosystem
 
     def _drain_latest_delta(self):
-        """Drain the latest topology delta from Elmer's inbound tract.
+        """Read the latest topology delta from already-drained peer events.
 
-        The bucket dips into the River. Full-fidelity hyperedge structure,
-        causal chains, predictions — the only Law-compliant place where
-        Tier 3 structure is visible.
+        Reads _peer_events on the tract bridge — data that the ecosystem's
+        own drain cycle already absorbed into the local substrate. Same
+        pattern Bunyan uses. Does NOT call bridge.drain() (that would
+        compete with the ecosystem's drain cycle and steal data).
+
+        Returns the most recent topology_delta, or None if none available.
         """
         if not self._ecosystem:
             return None
         bridge = getattr(self._ecosystem, '_peer_bridge', None)
         if bridge is None:
             return None
-        try:
-            entries = bridge.drain()
-            if not entries:
-                return None
-            for entry in reversed(entries):
-                if isinstance(entry, dict) and entry.get('type') == 'topology_delta':
-                    return entry
+        peer_events = getattr(bridge, '_peer_events', [])
+        if not peer_events:
             return None
-        except Exception:
-            return None
+        # Most recent topology delta
+        for entry in reversed(peer_events):
+            if isinstance(entry, dict) and entry.get('type') == 'topology_delta':
+                return entry
+        return None
 
     def health(self) -> SocketHealth:
         h = self._make_health("healthy" if self._loaded else "offline")
