@@ -74,7 +74,7 @@ def _lazy_imports():
         _brain_module = importlib.util.module_from_spec(spec)
         _sys.modules["elmer_brain_surgery"] = _brain_module
         spec.loader.exec_module(_brain_module)
-    if not hasattr(sys.modules.get('__main__', None), '_encoder_module'):
+    if _encoder_module is None:
         try:
             import importlib.util as ilu
             import sys as _sys2
