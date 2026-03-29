@@ -9,6 +9,11 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-03-29] Claude Code (Opus 4.6) — Unified encoder, no v1/v2 split
+#   What: Single GraphEncoder reads whatever data is available. No branching.
+#   Why:  Same encoder for frozen and living brain. Reads topology deltas,
+#         live graph, or flat snapshots — richest first. Encoder params
+#         unfrozen on proto — Lenia evolves the mesh.
 # [2026-03-28] Claude Code (Opus 4.6) — v2 reads Elmer's own substrate
 #   What: Proto socket reads Elmer's local NG-Lite directly via ecosystem ref.
 #   Why:  Same as BrainSocket — the River deposited topology here. Read it
@@ -46,6 +51,7 @@ logger = logging.getLogger("elmer.proto_brain")
 _torch = None
 _brain_module = None
 _lenia_module = None
+_encoder_module = None
 
 
 def _lazy_imports():
@@ -63,6 +69,19 @@ def _lazy_imports():
         _brain_module = importlib.util.module_from_spec(spec)
         _sys.modules["elmer_brain_surgery"] = _brain_module
         spec.loader.exec_module(_brain_module)
+    if _encoder_module is None:
+        try:
+            import importlib.util as ilu2
+            import sys as _sys2
+            spec = ilu2.spec_from_file_location(
+                "graph_encoder",
+                os.path.expanduser("~/UniAI/surgery/graph_encoder.py"),
+            )
+            _encoder_module = ilu2.module_from_spec(spec)
+            _sys2.modules["graph_encoder"] = _encoder_module
+            spec.loader.exec_module(_encoder_module)
+        except Exception:
+            _encoder_module = None
     if _lenia_module is None:
         import importlib.util as ilu
         import sys as _sys
@@ -93,8 +112,7 @@ class ProtoUniBrainSocket(ElmerSocket):
         self._model_path = model_path or os.path.expanduser(
             "~/UniAI/models/elmer_brain_v0.1.pt"
         )
-        self._brain = None
-        self._brain_v2 = None
+        self._brain = None  # unified ElmerBrain with GraphEncoder
         self._lenia = None
         self._config = None
         self._lenia_steps = 0
@@ -142,13 +160,31 @@ class ProtoUniBrainSocket(ElmerSocket):
             body = base.model
             body.embed_tokens = None
 
-            self._brain = _brain_module.ElmerBrain(body, self._config['hidden_size'])
-            del base  # frees lm_head and anything else we don't need
+            # Load v1 brain to get transformer body + decoder
+            v1_brain = _brain_module.ElmerBrain(body, self._config['hidden_size'])
+            del base
             gc.collect()
+
+            # Build unified brain with GraphEncoder
+            if _encoder_module is not None:
+                self._brain = _encoder_module.ElmerBrain(
+                    v1_brain.transformer_body,
+                    v1_brain.decoder,
+                    self._config['hidden_size'],
+                )
+                logger.info("ProtoUniBrain: unified GraphEncoder loaded")
+            else:
+                self._brain = v1_brain
+                logger.info("ProtoUniBrain: unified encoder not available, using v1")
 
             # UNFREEZE the transformer body — this is the key difference
             for param in self._brain.transformer_body.parameters():
                 param.requires_grad = True
+
+            # Encoder params also unfrozen — Lenia evolves the mesh
+            if hasattr(self._brain, 'encoder'):
+                for param in self._brain.encoder.parameters():
+                    param.requires_grad = True
 
             # Attach Lenia dynamics engine
             self._lenia = _lenia_module.LeniaEngine(
@@ -164,27 +200,6 @@ class ProtoUniBrainSocket(ElmerSocket):
                 ),
             )
             self._lenia.register_hooks()
-
-            # Build v2 brain — same transformer body + decoder, v2 encoder
-            # Encoder params are part of the mesh — Lenia evolves them
-            try:
-                import importlib.util
-                v2_spec = importlib.util.spec_from_file_location(
-                    "encoder_v2",
-                    os.path.expanduser("~/UniAI/surgery/encoder_v2.py"),
-                )
-                v2_mod = importlib.util.module_from_spec(v2_spec)
-                v2_spec.loader.exec_module(v2_mod)
-                self._brain_v2 = v2_mod.ElmerBrainV2(
-                    self._brain.transformer_body,
-                    self._brain.decoder,
-                    self._config['hidden_size'],
-                )
-                # v2 encoder params are UNFROZEN — Lenia evolves the mesh
-                logger.info("ProtoUniBrain v2 encoder loaded (mesh params evolve under Lenia)")
-            except Exception as v2_exc:
-                logger.info("ProtoUniBrain v2 not available, v1 only: %s", v2_exc)
-                self._brain_v2 = None
 
             self._brain.eval()
             self._loaded = True
@@ -225,7 +240,7 @@ class ProtoUniBrainSocket(ElmerSocket):
         self._process_count += 1
 
         try:
-            # 1. Read Elmer's own substrate + latest topology delta from River
+            # 1. Gather all available data sources
             autonomic = context.get('autonomic_state', 'PARASYMPATHETIC')
             graph = None
             latest_delta = None
@@ -233,14 +248,17 @@ class ProtoUniBrainSocket(ElmerSocket):
                 graph = getattr(self._ecosystem, '_graph', None)
                 latest_delta = self._drain_latest_delta()
 
-            if graph is not None and latest_delta is not None and self._brain_v2 is not None:
-                # v2 path — local substrate + River delta, Lenia on full mesh
-                with _torch.no_grad():
-                    output = self._brain_v2(graph, latest_delta, autonomic)
-            else:
-                # v1 fallback — flat aggregates from GraphSnapshot
-                substrate_state = self._snapshot_to_substrate(snapshot)
-                with _torch.no_grad():
+            # Single path — encoder reads whatever's available
+            with _torch.no_grad():
+                if hasattr(self._brain, 'encoder') and hasattr(self._brain.encoder, 'topology_proj'):
+                    output = self._brain(
+                        topology_delta=latest_delta,
+                        graph=graph,
+                        snapshot=snapshot,
+                        autonomic_state=autonomic,
+                    )
+                else:
+                    substrate_state = self._snapshot_to_substrate(snapshot)
                     output = self._brain(substrate_state)
 
             # 2. Lenia dynamics step — THE LEARNING

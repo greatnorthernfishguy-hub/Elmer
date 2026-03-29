@@ -10,6 +10,13 @@ ProtoUniBrain (Phase 0) will be a second instance with Lenia dynamics
 on the unfrozen transformer body, running alongside this one.
 
 # ---- Changelog ----
+# [2026-03-29] Claude Code (Opus 4.6) — Unified encoder, no v1/v2 split
+#   What: Single GraphEncoder reads whatever data is available. No branching.
+#   Why:  The substrate doesn't care about versions. One encoder reads
+#         topology deltas, live graph, or flat snapshots — richest first.
+#   How:  load() builds unified ElmerBrain with GraphEncoder from
+#         graph_encoder.py. process() passes all available data sources.
+#         Falls back to v1 only if unified encoder not importable.
 # [2026-03-28] Claude Code (Opus 4.6) — v2 reads Elmer's own substrate
 #   What: Brain socket reads Elmer's local NG-Lite directly via ecosystem ref.
 #   Why:  The River deposited topology into Elmer's substrate. The encoder
@@ -48,11 +55,12 @@ logger = logging.getLogger("elmer.brain_socket")
 # Torch is heavy — import lazily so Elmer can still start without it
 _torch = None
 _brain_module = None
+_encoder_module = None
 
 
 def _lazy_imports():
-    """Import torch and brain module on first use."""
-    global _torch, _brain_module
+    """Import torch and unified encoder on first use."""
+    global _torch, _brain_module, _encoder_module
     if _torch is None:
         import torch
         _torch = torch
@@ -66,6 +74,19 @@ def _lazy_imports():
         _brain_module = importlib.util.module_from_spec(spec)
         _sys.modules["elmer_brain_surgery"] = _brain_module
         spec.loader.exec_module(_brain_module)
+    if not hasattr(sys.modules.get('__main__', None), '_encoder_module'):
+        try:
+            import importlib.util as ilu
+            import sys as _sys2
+            spec = ilu.spec_from_file_location(
+                "graph_encoder",
+                os.path.expanduser("~/UniAI/surgery/graph_encoder.py"),
+            )
+            _encoder_module = ilu.module_from_spec(spec)
+            _sys2.modules["graph_encoder"] = _encoder_module
+            spec.loader.exec_module(_encoder_module)
+        except Exception:
+            _encoder_module = None
 
 
 class BrainSocket(ElmerSocket):
@@ -81,10 +102,9 @@ class BrainSocket(ElmerSocket):
         self._model_path = model_path or os.path.expanduser(
             "~/UniAI/models/elmer_brain_v0.1.pt"
         )
-        self._brain = None
-        self._brain_v2 = None
+        self._brain = None  # unified ElmerBrain with GraphEncoder
         self._config = None
-        self._ecosystem = ecosystem  # Elmer's own NGEcosystem — set after engine start
+        self._ecosystem = ecosystem
 
     @property
     def socket_id(self) -> str:
@@ -124,35 +144,26 @@ class BrainSocket(ElmerSocket):
             body = base_model.model
             body.embed_tokens = None
 
-            self._brain = _brain_module.ElmerBrain(body, self._config['hidden_size'])
-            self._brain.load_state_dict(checkpoint['model_state_dict'])
-            self._brain.eval()
+            # Load v1 brain to get transformer body + decoder
+            v1_brain = _brain_module.ElmerBrain(body, self._config['hidden_size'])
+            v1_brain.load_state_dict(checkpoint['model_state_dict'])
 
-            # Freeze everything for the stable reference brain
-            for param in self._brain.parameters():
-                param.requires_grad = False
-
-            # Build v2 brain — same transformer body + decoder, v2 encoder
-            try:
-                import importlib.util
-                v2_spec = importlib.util.spec_from_file_location(
-                    "encoder_v2",
-                    os.path.expanduser("~/UniAI/surgery/encoder_v2.py"),
-                )
-                v2_mod = importlib.util.module_from_spec(v2_spec)
-                v2_spec.loader.exec_module(v2_mod)
-                self._brain_v2 = v2_mod.ElmerBrainV2(
-                    self._brain.transformer_body,
-                    self._brain.decoder,
+            # Build unified brain with GraphEncoder
+            if _encoder_module is not None:
+                self._brain = _encoder_module.ElmerBrain(
+                    v1_brain.transformer_body,
+                    v1_brain.decoder,
                     self._config['hidden_size'],
                 )
-                self._brain_v2.eval()
-                for param in self._brain_v2.parameters():
-                    param.requires_grad = False
-                logger.info("BrainSocket v2 encoder loaded")
-            except Exception as v2_exc:
-                logger.info("BrainSocket v2 not available, v1 only: %s", v2_exc)
-                self._brain_v2 = None
+                logger.info("BrainSocket: unified GraphEncoder loaded")
+            else:
+                # Fallback: use v1 brain directly
+                self._brain = v1_brain
+                logger.info("BrainSocket: unified encoder not available, using v1")
+
+            self._brain.eval()
+            for param in self._brain.parameters():
+                param.requires_grad = False
 
             self._loaded = True
             logger.info(
@@ -174,12 +185,7 @@ class BrainSocket(ElmerSocket):
         logger.info("BrainSocket unloaded")
 
     def process(self, snapshot: GraphSnapshot, context: dict) -> SocketOutput:
-        """Process through ElmerBrain — v2 encoder if graph available, v1 fallback.
-
-        If context contains 'graph' and 'step_result' (provided by the engine
-        when the ecosystem is initialized), uses the substrate-native v2 encoder
-        that reads live NGLite objects. Otherwise falls back to v1 flat aggregates.
-        """
+        """Process through unified encoder — reads richest data available."""
         if not self._loaded or self._brain is None:
             raise RuntimeError("BrainSocket not loaded")
 
@@ -189,22 +195,26 @@ class BrainSocket(ElmerSocket):
         try:
             autonomic = context.get('autonomic_state', 'PARASYMPATHETIC')
 
-            # Read Elmer's own substrate + latest topology delta from the River
+            # Gather all available data sources
             graph = None
             latest_delta = None
             if self._ecosystem:
                 graph = getattr(self._ecosystem, '_graph', None)
-                # Drain the latest topology delta from the tract — the bucket dips
                 latest_delta = self._drain_latest_delta()
 
-            if graph is not None and latest_delta is not None and self._brain_v2 is not None:
-                # v2 path — local substrate + River delta (full hyperedge fidelity)
-                with _torch.no_grad():
-                    output = self._brain_v2(graph, latest_delta, autonomic)
-            else:
-                # v1 fallback — flat aggregates from GraphSnapshot
-                substrate_state = self._snapshot_to_substrate(snapshot)
-                with _torch.no_grad():
+            # Single path — encoder reads whatever's available
+            with _torch.no_grad():
+                if hasattr(self._brain, 'encoder') and hasattr(self._brain.encoder, 'topology_proj'):
+                    # Unified encoder — pass all sources
+                    output = self._brain(
+                        topology_delta=latest_delta,
+                        graph=graph,
+                        snapshot=snapshot,
+                        autonomic_state=autonomic,
+                    )
+                else:
+                    # v1 fallback (unified encoder not loaded)
+                    substrate_state = self._snapshot_to_substrate(snapshot)
                     output = self._brain(substrate_state)
 
             # Map decoder output to SubstrateSignal
