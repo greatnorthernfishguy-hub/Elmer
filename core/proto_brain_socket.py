@@ -55,7 +55,7 @@ _encoder_module = None
 
 
 def _lazy_imports():
-    global _torch, _brain_module, _lenia_module
+    global _torch, _brain_module, _lenia_module, _encoder_module
     if _torch is None:
         import torch
         _torch = torch
