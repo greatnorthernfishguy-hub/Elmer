@@ -1,0 +1,28 @@
+[Unit]
+Description=Elmer — Cognitive Substrate Service (Brainstem)
+Documentation=https://github.com/greatnorthernfishguy-hub/Elmer
+After=network.target openclaw-gateway.service
+Wants=openclaw-gateway.service
+
+[Service]
+Type=simple
+User=josh
+WorkingDirectory=/home/josh/Elmer
+Environment=PYTHONPATH=/home/josh/Elmer
+Environment=ELMER_SERVICE_PORT=7438
+Environment=ELMER_DRAIN_INTERVAL=10.0
+Environment=ELMER_BRAIN_DELAY=5.0
+ExecStart=/home/josh/Elmer/venv/bin/python3 /home/josh/Elmer/elmer_service.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/josh/Elmer/logs/elmer_service.log
+StandardError=append:/home/josh/Elmer/logs/elmer_service.log
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/josh/Elmer /home/josh/.et_modules /home/josh/.openclaw /home/josh/UniAI /tmp
+ProtectHome=no
+
+[Install]
+WantedBy=multi-user.target

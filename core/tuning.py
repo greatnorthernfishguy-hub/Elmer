@@ -38,6 +38,14 @@ Competence Model — Continuous, Not Tiered:
     topology already encodes the successful tuning patterns.
 
 # ---- Changelog ----
+# [2026-03-26] Claude Code Opus — Punchlist #44: Adaptive relevance thresholds
+#   What: Added relevance_threshold to TuningSocket's monitored parameters
+#   Why: Punchlist #44 — peer bridge relevance_threshold should adapt based on
+#     event volume and absorption quality, not remain static at 0.30
+#   How: TuningSocket gets a bridge ref (same pattern as MyelinationSocket).
+#     _extract_absorption_rate() computes the fraction of peer events that pass
+#     the relevance threshold. Bootstrap range for absorption_rate: 0.10–0.60.
+#     Too few events absorbed → lower threshold. Too many → raise it.
 # [2026-03-24] Claude Code (Opus 4.6) — Continuous competence model
 #   What: Replaced static healthy ranges and fixed step size with continuous
 #     per-parameter competence scoring.  Competence [0,1] derived from
@@ -82,6 +90,7 @@ _BOOTSTRAP_RANGES = {
     "avg_weight":       (0.20, 0.65),
     "node_utilization": (0.10, 0.80),
     "synapse_density":  (1.0,  8.0),
+    "absorption_rate":  (0.10, 0.60),   # Punchlist #44 — fraction of peer events absorbed
 }
 
 # How much the healthy range expands at full competence.
@@ -121,6 +130,7 @@ class TuningSocket(ElmerSocket):
     def __init__(self) -> None:
         super().__init__()
         self._ng_lite_ref = None  # Set by engine after registration
+        self._bridge_ref = None   # Set by engine for absorption rate (#44)
         self._last_health_snapshot: Dict[str, float] = {}
         self._tuning_history: List[Dict[str, Any]] = []
         self._history_max = 500
@@ -131,6 +141,10 @@ class TuningSocket(ElmerSocket):
 
         # Per-parameter outcome counts for the minimum-outcomes gate.
         self._outcome_counts: Dict[str, int] = {}
+
+        # Punchlist #44: track absorption metrics across cycles
+        self._last_peer_events_cached = 0
+        self._last_drain_count = 0
 
     @property
     def socket_id(self) -> str:
@@ -167,6 +181,15 @@ class TuningSocket(ElmerSocket):
         substrate, not another module's.
         """
         self._ng_lite_ref = ng_lite
+
+    def set_bridge_ref(self, bridge) -> None:
+        """Engine provides a reference to the peer/tract bridge for absorption metrics.
+
+        Punchlist #44: needed to compute absorption rate for
+        relevance_threshold tuning.  Same pattern as MyelinationSocket.
+        NOT a Law 1 violation — Elmer reads its own bridge stats.
+        """
+        self._bridge_ref = bridge
 
     # -------------------------------------------------------------------
     # Competence
@@ -378,7 +401,53 @@ class TuningSocket(ElmerSocket):
             "weight_health": weight_health,
             "overall_health": overall_health,
             "coherence": snapshot.metadata.get("coherence", 1.0),
+            "absorption_rate": self._extract_absorption_rate(),
         }
+
+    def _extract_absorption_rate(self) -> float:
+        """Estimate peer event absorption rate from bridge stats.
+
+        Punchlist #44.  Absorption rate = fraction of peer events that
+        would pass the current relevance_threshold.  Approximated by
+        comparing cached peer event growth vs drain/sync count growth.
+
+        If no bridge is available or no data yet, returns the midpoint
+        of the bootstrap range (neutral — no tuning signal).
+        """
+        if self._bridge_ref is None or not hasattr(self._bridge_ref, 'get_stats'):
+            return 0.35  # Neutral midpoint
+
+        stats = self._bridge_ref.get_stats()
+        peer_cached = stats.get("peer_events_cached", 0)
+
+        # Use drain_count (tract bridge) or sync_count (peer bridge)
+        drain_count = stats.get("drain_count", stats.get("sync_count", 0))
+
+        # On first call, just record baseline
+        if self._last_drain_count == 0 and drain_count == 0:
+            self._last_peer_events_cached = peer_cached
+            self._last_drain_count = drain_count
+            return 0.35  # No data yet
+
+        # Compute delta since last check
+        events_delta = peer_cached - self._last_peer_events_cached
+        drain_delta = drain_count - self._last_drain_count
+
+        # Update tracking
+        self._last_peer_events_cached = peer_cached
+        self._last_drain_count = drain_count
+
+        if drain_delta <= 0 or events_delta <= 0:
+            return 0.35  # No new activity — neutral
+
+        # Approximate absorption: events cached per drain cycle relative
+        # to a baseline.  Higher peer_events_cached growth per drain
+        # means more events are passing the threshold (high absorption).
+        # Normalize: assume ~50 events per drain is "normal" throughput.
+        events_per_drain = events_delta / max(drain_delta, 1)
+        absorption = min(1.0, events_per_drain / 50.0)
+
+        return absorption
 
     # -------------------------------------------------------------------
     # Diagnosis and recommendation
@@ -463,6 +532,26 @@ class TuningSocket(ElmerSocket):
             rec = self._propose_adjustment(
                 "pruning_threshold", tunables["pruning_threshold"], direction=1,
                 reason=f"synapse_density {syn_density:.2f} > {d_hi:.2f} (over-connected)",
+            )
+            if rec:
+                recommendations.append(rec)
+
+        # --- Peer event absorption rate (Punchlist #44) ---
+        absorption = health.get("absorption_rate", 0.35)
+        a_lo, a_hi = self._effective_range("absorption_rate")
+        if absorption < a_lo and "relevance_threshold" in tunables:
+            # Too few events absorbed — threshold is too high, lower it
+            rec = self._propose_adjustment(
+                "relevance_threshold", tunables["relevance_threshold"], direction=-1,
+                reason=f"absorption_rate {absorption:.3f} < {a_lo:.3f} (starved — threshold too high)",
+            )
+            if rec:
+                recommendations.append(rec)
+        elif absorption > a_hi and "relevance_threshold" in tunables:
+            # Too many events flooding in — threshold is too low, raise it
+            rec = self._propose_adjustment(
+                "relevance_threshold", tunables["relevance_threshold"], direction=1,
+                reason=f"absorption_rate {absorption:.3f} > {a_hi:.3f} (flooded — threshold too low)",
             )
             if rec:
                 recommendations.append(rec)

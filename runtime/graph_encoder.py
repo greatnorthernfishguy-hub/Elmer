@@ -38,7 +38,8 @@ class GraphEncoder:
     Ref: PRD §9
     """
 
-    def __init__(self, embedding_dim: int = 384) -> None:
+    # [2026-03-29] Fixed: 384→768 to match ecosystem standard (punchlist #101)
+    def __init__(self, embedding_dim: int = 768) -> None:
         self._embedding_dim = embedding_dim
 
     def signal_to_snapshot(self, signal: SubstrateSignal) -> GraphSnapshot:
