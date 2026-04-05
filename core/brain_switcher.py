@@ -75,6 +75,40 @@ class BrainSwitcher:
         self._monitor_thread: Optional[threading.Thread] = None
         self._running = False
         self._lock = threading.Lock()
+        self._tonic_engine = None  # set via set_tonic_engine()
+
+    def set_tonic_engine(self, engine):
+        """Give BrainSwitcher a reference to the TonicEngine.
+
+        When ProtoUniBrain loads/unloads, the switcher offers/revokes
+        the shared transformer body. The Tonic hot-swaps without stopping.
+        """
+        self._tonic_engine = engine
+        # If proto is already loaded, offer immediately
+        if self._active_brain in ("both", "proto_unibrain"):
+            self._offer_body_to_tonic()
+
+    def _offer_body_to_tonic(self):
+        """Offer ProtoUniBrain's body to the Tonic engine."""
+        if self._tonic_engine is None:
+            return
+        try:
+            proto = self._socket_manager.get("elmer:proto_unibrain")
+            if proto and getattr(proto, '_loaded', False) and getattr(proto, '_brain', None):
+                body = getattr(proto._brain, 'transformer_body', None)
+                if body is not None:
+                    self._tonic_engine.offer_shared_body(body)
+        except Exception as exc:
+            logger.debug("Failed to offer body to Tonic: %s", exc)
+
+    def _revoke_body_from_tonic(self):
+        """Tell Tonic to reload its own body — ProtoUniBrain being shed."""
+        if self._tonic_engine is None:
+            return
+        try:
+            self._tonic_engine.revoke_shared_body()
+        except Exception as exc:
+            logger.debug("Failed to revoke body from Tonic: %s", exc)
 
     @property
     def active_brain(self) -> str:
@@ -265,6 +299,7 @@ class BrainSwitcher:
             if ok_brain and ok_proto:
                 self._active_brain = "both"
                 logger.info("Both brains active (frozen + living)")
+                self._offer_body_to_tonic()
             elif ok_brain:
                 self._active_brain = "elmer_brain"
                 logger.info("ElmerBrain only (ProtoUniBrain unavailable)")
@@ -277,6 +312,7 @@ class BrainSwitcher:
     def _shed_proto_unibrain(self):
         """Shed ProtoUniBrain to free resources, keep ElmerBrain."""
         with self._lock:
+            self._revoke_body_from_tonic()
             try:
                 self._socket_manager.unregister("elmer:proto_unibrain")
             except (ValueError, KeyError):
@@ -299,6 +335,7 @@ class BrainSwitcher:
                     self._active_brain = "both"
                     self._last_switch_time = time.time()
                     logger.info("ProtoUniBrain restored — both brains active")
+                    self._offer_body_to_tonic()
                 else:
                     self._socket_manager.unregister(proto_socket.socket_id)
                     logger.warning("ProtoUniBrain restore failed")

@@ -107,6 +107,7 @@ class ElmerHook(OpenClawAdapter):
     """
 
     MODULE_ID = "elmer"
+    SKIP_ECOSYSTEM = True
     SKILL_NAME = "Elmer Cognitive Substrate"
     WORKSPACE_ENV = "ELMER_WORKSPACE_DIR"
     DEFAULT_WORKSPACE = "~/.openclaw/elmer"

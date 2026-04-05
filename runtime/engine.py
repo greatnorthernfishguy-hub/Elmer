@@ -336,6 +336,11 @@ class ElmerEngine:
         logger.info("Elmer engine started: %s", report)
         return report
 
+    def set_tonic_engine(self, tonic_engine):
+        """Pass tonic engine ref to BrainSwitcher for hot-swap."""
+        if self._brain_switcher:
+            self._brain_switcher.set_tonic_engine(tonic_engine)
+
     def load_brains(self) -> None:
         """Load brain sockets into an already-running engine.
 
@@ -469,14 +474,13 @@ class ElmerEngine:
             try:
                 encoding = self._graph_encoder.encode(final_signal)
                 if encoding and "embedding" in encoding:
-                    import numpy as np
-                    embedding = np.array(encoding["embedding"])
+                    embedding = encoding["embedding"]
                     outcome = self._ecosystem.dual_record_outcome(
                         content=text,
                         embedding=embedding,
                         target_id="elmer:substrate_input",
                         success=True,
-                        metadata={"process_id": self._process_count},
+                        metadata={"process_id": str(self._process_count)},
                     )
 
                     # Cricket rim: if record_outcome hit a constitutional node,
@@ -754,28 +758,124 @@ class ElmerEngine:
         """Process snapshot through brain sockets. Called from drain thread.
 
         Runs the brain sockets (frozen + proto w/ Lenia) on the snapshot.
+        Logs the competence delta between frozen and proto outputs.
         This is the expensive path (~65s per Lenia step on CPU). Runs
         on the drain thread, not the fan-out thread.
         """
         if not self._brain_switcher or self._brain_switcher.active_brain == "none":
             return
 
+        frozen_output = None
+        proto_output = None
+
         try:
-            # Route to brain sockets only (not all sockets)
-            for socket_id in ["elmer:brain", "elmer:proto_unibrain"]:
-                sock = self._socket_manager.get_socket(socket_id)
-                if sock and hasattr(sock, 'process'):
-                    try:
-                        output = sock.process(snapshot, context)
-                        logger.info(
-                            "Brain drain: %s processed (%.1fs)",
-                            socket_id,
-                            output.processing_time if hasattr(output, 'processing_time') else 0,
-                        )
-                    except Exception as exc:
-                        logger.warning("Brain drain: %s error: %s", socket_id, exc)
+            # Process frozen brain first
+            frozen_sock = self._socket_manager.get_socket("elmer:brain")
+            if frozen_sock and hasattr(frozen_sock, 'process'):
+                try:
+                    frozen_output = frozen_sock.process(snapshot, context)
+                    logger.info(
+                        "Brain drain: elmer:brain processed (%.1fs)",
+                        frozen_output.processing_time if hasattr(frozen_output, 'processing_time') else 0,
+                    )
+                except Exception as exc:
+                    logger.warning("Brain drain: elmer:brain error: %s", exc)
+
+            # Process proto brain
+            proto_sock = self._socket_manager.get_socket("elmer:proto_unibrain")
+            if proto_sock and hasattr(proto_sock, 'process'):
+                try:
+                    proto_output = proto_sock.process(snapshot, context)
+                    logger.info(
+                        "Brain drain: elmer:proto_unibrain processed (%.1fs)",
+                        proto_output.processing_time if hasattr(proto_output, 'processing_time') else 0,
+                    )
+                except Exception as exc:
+                    logger.warning("Brain drain: elmer:proto_unibrain error: %s", exc)
+
+            # Log competence delta
+            if frozen_output and proto_output:
+                self._log_competence_delta(frozen_output, proto_output)
+
         except Exception as exc:
             logger.warning("Brain drain processing error: %s", exc)
+
+    def _log_competence_delta(self, frozen_output: SocketOutput, proto_output: SocketOutput) -> None:
+        """Log the signal delta between frozen and proto brains.
+
+        The delta IS the competence measure. As proto evolves via Lenia:
+          - Shrinking delta = proto converging toward frozen (learning)
+          - Growing delta = proto diverging (exploring or degrading)
+          - Signal-specific deltas show WHERE proto differs
+        """
+        try:
+            import json, os
+            from datetime import datetime
+
+            delta_path = os.path.expanduser("~/.elmer/competence_delta.jsonl")
+            os.makedirs(os.path.dirname(delta_path), exist_ok=True)
+
+            frozen_sig = frozen_output.signal
+            proto_sig = proto_output.signal
+
+            # Extract signal values
+            frozen_vals = {
+                'coherence': frozen_sig.coherence_score,
+                'health': frozen_sig.health_score,
+                'anomaly': frozen_sig.anomaly_level,
+                'novelty': frozen_sig.novelty,
+                'confidence': frozen_sig.confidence,
+                'severity': frozen_sig.severity,
+                'identity_coherence': frozen_sig.identity_coherence,
+                'pruning_pressure': frozen_sig.pruning_pressure,
+                'topology_health': frozen_sig.topology_health,
+            }
+            proto_vals = {
+                'coherence': proto_sig.coherence_score,
+                'health': proto_sig.health_score,
+                'anomaly': proto_sig.anomaly_level,
+                'novelty': proto_sig.novelty,
+                'confidence': proto_sig.confidence,
+                'severity': proto_sig.severity,
+                'identity_coherence': proto_sig.identity_coherence,
+                'pruning_pressure': proto_sig.pruning_pressure,
+                'topology_health': proto_sig.topology_health,
+            }
+
+            # Per-signal delta (proto - frozen)
+            deltas = {k: round(proto_vals[k] - frozen_vals[k], 6) for k in frozen_vals}
+
+            # L2 norm of the delta vector — single number for overall divergence
+            import math
+            l2_norm = round(math.sqrt(sum(d ** 2 for d in deltas.values())), 6)
+
+            # Lenia metadata from proto
+            proto_meta = proto_sig.metadata or {}
+            lenia_step = proto_meta.get('lenia_step', 0)
+            lenia_delta_norm = proto_meta.get('lenia_delta_norm', 0)
+
+            entry = {
+                'timestamp': datetime.now().isoformat(),
+                'lenia_step': lenia_step,
+                'l2_divergence': l2_norm,
+                'frozen_confidence': frozen_output.confidence,
+                'proto_confidence': proto_output.confidence,
+                'deltas': deltas,
+                'frozen_signals': {k: round(v, 6) for k, v in frozen_vals.items()},
+                'proto_signals': {k: round(v, 6) for k, v in proto_vals.items()},
+                'lenia_delta_norm': lenia_delta_norm,
+            }
+
+            with open(delta_path, 'a') as f:
+                f.write(json.dumps(entry) + '\n')
+
+            logger.info(
+                "Competence delta: L2=%.4f, lenia_step=%d, lenia_weight_delta=%.6f",
+                l2_norm, lenia_step, lenia_delta_norm,
+            )
+
+        except Exception as exc:
+            logger.debug("Competence delta logging failed: %s", exc)
 
     # -----------------------------------------------------------------
     # Health  (PRD §14)
