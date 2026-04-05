@@ -672,8 +672,12 @@ class ElmerEngine:
                     # The River always has fresh topology from the Tonic.
                     try:
                         from core.base_socket import GraphSnapshot
+                        autonomic = ng_autonomic.read_state()
                         empty_snapshot = GraphSnapshot(nodes=[], edges=[], metadata={})
-                        empty_context = {"autonomic_state": "PARASYMPATHETIC"}
+                        empty_context = {
+                            "autonomic_state": autonomic.get("state", "PARASYMPATHETIC"),
+                            "autonomic_intensity": autonomic.get("threat_level", "none"),
+                        }
                         self._process_brain_sockets_kissed(
                             empty_snapshot, empty_context, []
                         )
