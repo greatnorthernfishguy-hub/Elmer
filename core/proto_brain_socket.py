@@ -53,6 +53,12 @@ _brain_module = None
 _lenia_module = None
 _encoder_module = None
 
+# Persistence paths — proto brain survives restarts
+_PROTO_WEIGHTS_PATH = os.path.expanduser("~/.elmer/proto_weights.pt")
+_PROTO_LENIA_STATE_PATH = os.path.expanduser("~/.elmer/proto_lenia_state.pt")
+_DELTA_LOG_PATH = os.path.expanduser("~/.elmer/competence_delta.jsonl")
+_WEIGHT_STATS_LOG_PATH = os.path.expanduser("~/.elmer/weight_stats.jsonl")
+
 
 def _lazy_imports():
     global _torch, _brain_module, _lenia_module, _encoder_module
@@ -211,6 +217,10 @@ class ProtoUniBrainSocket(ElmerSocket):
                 "ProtoUniBrain loaded: %d trainable params, Lenia attached",
                 trainable,
             )
+
+            # Restore previously evolved weights (if any)
+            self._restore_evolved_weights()
+
             return True
 
         except Exception as exc:
@@ -219,6 +229,9 @@ class ProtoUniBrainSocket(ElmerSocket):
             return False
 
     def unload(self) -> None:
+        if self._loaded and self._brain is not None:
+            self.save_evolved_weights()
+            self.log_weight_stats()
         if self._lenia:
             self._lenia.remove_hooks()
         self._brain = None
@@ -229,9 +242,11 @@ class ProtoUniBrainSocket(ElmerSocket):
         logger.info("ProtoUniBrain unloaded")
 
     def process(self, snapshot: GraphSnapshot, context: dict) -> SocketOutput:
-        """Process snapshot AND apply Lenia dynamics.
+        """Read topology from the River, run forward pass, apply Lenia dynamics.
 
-        This is where the model learns. Every call reshapes the weights.
+        The River is the input. The encoder is the bucket. No bridges,
+        no _peer_events, no snapshot passthrough. Binary topology delta
+        from BTF tract -> Rust feature extraction -> forward -> Lenia step.
         """
         if not self._loaded or self._brain is None:
             raise RuntimeError("ProtoUniBrain not loaded")
@@ -240,30 +255,26 @@ class ProtoUniBrainSocket(ElmerSocket):
         self._process_count += 1
 
         try:
-            # 1. Gather all available data sources
             autonomic = context.get('autonomic_state', 'PARASYMPATHETIC')
-            graph = None
-            latest_delta = None
-            if self._ecosystem:
-                graph = getattr(self._ecosystem, '_graph', None)
-                latest_delta = self._drain_latest_delta()
 
-            # Single path — encoder reads whatever's available
+            # Read latest topology delta from the River (BTF tract)
+            latest_delta = self._read_river_delta()
+
+            # Forward pass — encoder extracts from topology delta (BTF fast path)
             with _torch.no_grad():
-                if hasattr(self._brain, 'encoder') and hasattr(self._brain.encoder, 'topology_proj'):
-                    output = self._brain(
-                        topology_delta=latest_delta,
-                        graph=graph,
-                        snapshot=snapshot,
-                        autonomic_state=autonomic,
-                    )
-                else:
-                    substrate_state = self._snapshot_to_substrate(snapshot)
-                    output = self._brain(substrate_state)
+                output = self._brain(
+                    topology_delta=latest_delta,
+                    autonomic_state=autonomic,
+                )
 
-            # 2. Lenia dynamics step — THE LEARNING
+            # Lenia dynamics step — THE LEARNING
             lenia_metrics = self._lenia.step()
             self._lenia_steps += 1
+
+            # 3b. Periodic persistence — save every 5 Lenia steps
+            if self._lenia_steps % 5 == 0 and self._lenia_steps > 0:
+                self.save_evolved_weights()
+                self.log_weight_stats()
 
             # 4. Build signal from output
             signals = output['signals'][0].tolist()
@@ -332,29 +343,160 @@ class ProtoUniBrainSocket(ElmerSocket):
         """Set reference to Elmer's own ecosystem. Called by engine after init."""
         self._ecosystem = ecosystem
 
-    def _drain_latest_delta(self):
-        """Read the latest topology delta from already-drained peer events.
+    # -----------------------------------------------------------------
+    # Weight persistence — proto brain survives fan-out cycles
+    # -----------------------------------------------------------------
 
-        Reads _peer_events on the tract bridge — data that the ecosystem's
-        own drain cycle already absorbed into the local substrate. Same
-        pattern Bunyan uses. Does NOT call bridge.drain() (that would
-        compete with the ecosystem's drain cycle and steal data).
+    def _restore_evolved_weights(self) -> bool:
+        """Restore previously evolved weights + Lenia state from disk.
 
-        Returns the most recent topology_delta, or None if none available.
+        Returns True if restored, False if starting fresh.
         """
-        if not self._ecosystem:
+        os.makedirs(os.path.dirname(_PROTO_WEIGHTS_PATH), exist_ok=True)
+
+        if not os.path.exists(_PROTO_WEIGHTS_PATH):
+            logger.info("ProtoUniBrain: no persisted weights — starting fresh")
+            return False
+
+        try:
+            saved = _torch.load(_PROTO_WEIGHTS_PATH, map_location="cpu", weights_only=False)
+            self._brain.load_state_dict(saved['model_state_dict'], strict=False)
+            self._lenia_steps = saved.get('lenia_steps', 0)
+            logger.info(
+                "ProtoUniBrain: restored evolved weights (step %d, saved %s)",
+                self._lenia_steps,
+                saved.get('timestamp', 'unknown'),
+            )
+
+            # Restore Lenia engine state (initial norms for mass conservation)
+            if os.path.exists(_PROTO_LENIA_STATE_PATH) and self._lenia:
+                lenia_state = _torch.load(_PROTO_LENIA_STATE_PATH, map_location="cpu", weights_only=False)
+                self._lenia._initial_norms = lenia_state.get('initial_norms', {})
+                self._lenia.state.step_count = lenia_state.get('step_count', 0)
+                logger.info("ProtoUniBrain: restored Lenia state (norms for %d params)",
+                            len(self._lenia._initial_norms))
+
+            return True
+        except Exception as exc:
+            logger.warning("ProtoUniBrain: weight restore failed (%s) — starting fresh", exc)
+            return False
+
+    def save_evolved_weights(self) -> None:
+        """Persist current evolved weights + Lenia state to disk.
+
+        Called periodically during process() and on unload().
+        """
+        os.makedirs(os.path.dirname(_PROTO_WEIGHTS_PATH), exist_ok=True)
+
+        try:
+            from datetime import datetime
+            _torch.save({
+                'model_state_dict': self._brain.state_dict(),
+                'lenia_steps': self._lenia_steps,
+                'timestamp': datetime.now().isoformat(),
+                'process_count': self._process_count,
+            }, _PROTO_WEIGHTS_PATH)
+
+            # Save Lenia state separately (initial norms critical for mass conservation)
+            if self._lenia:
+                _torch.save({
+                    'initial_norms': self._lenia._initial_norms,
+                    'step_count': self._lenia.state.step_count,
+                    'weight_deltas': {k: v for k, v in self._lenia.state.weight_deltas.items()},
+                }, _PROTO_LENIA_STATE_PATH)
+
+            logger.info("ProtoUniBrain: weights saved (step %d)", self._lenia_steps)
+        except Exception as exc:
+            logger.error("ProtoUniBrain: weight save failed: %s", exc)
+
+    def log_weight_stats(self) -> None:
+        """Append current weight distribution stats to the log."""
+        os.makedirs(os.path.dirname(_WEIGHT_STATS_LOG_PATH), exist_ok=True)
+
+        try:
+            from datetime import datetime
+            import json
+
+            stats = {
+                'timestamp': datetime.now().isoformat(),
+                'lenia_step': self._lenia_steps,
+                'process_count': self._process_count,
+                'layers': {},
+            }
+
+            total_near_zero = 0
+            total_params = 0
+            for name, param in self._brain.parameters():
+                if param.requires_grad and param.dim() >= 2:
+                    near_zero = (param.abs() < 0.01).sum().item()
+                    total = param.numel()
+                    total_near_zero += near_zero
+                    total_params += total
+                    stats['layers'][name] = {
+                        'mean': round(param.mean().item(), 8),
+                        'std': round(param.std().item(), 6),
+                        'sparsity': round(near_zero / total, 4),
+                    }
+
+            stats['global_sparsity'] = round(total_near_zero / max(total_params, 1), 4)
+
+            with open(_WEIGHT_STATS_LOG_PATH, 'a') as f:
+                f.write(json.dumps(stats) + '\n')
+
+        except Exception as exc:
+            logger.debug("ProtoUniBrain: weight stats log failed: %s", exc)
+
+    def _read_river_delta(self):
+        """Read the latest topology delta from the River (BTF tract).
+
+        Reads the tail of the BTF tract file deposited by NeuroGraph.
+        Returns a PyTopologyEntry for the encoder's BTF fast path,
+        or None if no tract data available.
+
+        The River IS the input. No bridges, no _peer_events.
+        """
+        try:
+            import ng_tract
+            tract_path = os.path.expanduser(
+                "~/.et_modules/tracts/neurograph/elmer.tract"
+            )
+            if not os.path.exists(tract_path):
+                return None
+
+            # Read the last chunk of the tract — recent entries only.
+            # The tract grows continuously; we only need the latest delta.
+            chunk_size = 32768  # 32KB — enough for several topology entries
+            file_size = os.path.getsize(tract_path)
+            if file_size == 0:
+                return None
+
+            offset = max(0, file_size - chunk_size)
+            with open(tract_path, "rb") as f:
+                if offset > 0:
+                    f.seek(offset)
+                data = f.read()
+
+            # If we seeked into the middle, find the first valid entry
+            # by scanning for the BTF magic bytes (0x42, 0x54)
+            if offset > 0:
+                magic_pos = data.find(b"BT")
+                if magic_pos >= 0:
+                    data = data[magic_pos:]
+                else:
+                    # No valid entry in tail — read more
+                    with open(tract_path, "rb") as f:
+                        data = f.read()
+
+            reader = ng_tract.TractReader(data)
+            last_topo = None
+            for entry in reader:
+                if entry.entry_type == 2:  # topology
+                    last_topo = entry
+            return last_topo
+
+        except Exception as exc:
+            logger.debug("River read failed: %s", exc)
             return None
-        bridge = getattr(self._ecosystem, '_peer_bridge', None)
-        if bridge is None:
-            return None
-        peer_events = getattr(bridge, '_peer_events', [])
-        if not peer_events:
-            return None
-        # Most recent topology delta
-        for entry in reversed(peer_events):
-            if isinstance(entry, dict) and entry.get('type') == 'topology_delta':
-                return entry
-        return None
 
     def health(self) -> SocketHealth:
         h = self._make_health("healthy" if self._loaded else "offline")
@@ -370,62 +512,3 @@ class ProtoUniBrainSocket(ElmerSocket):
     # Feature extraction (same as BrainSocket)
     # -----------------------------------------------------------------
 
-    def _snapshot_to_substrate(self, snapshot: GraphSnapshot) -> dict:
-        """Convert GraphSnapshot to substrate_state dict."""
-        nodes = snapshot.nodes
-        edges = snapshot.edges
-        meta = snapshot.metadata
-
-        if nodes:
-            voltages = [n.get('voltage', 0.0) for n in nodes]
-            firing_rates = [n.get('firing_rate', 0.0) for n in nodes]
-            excitabilities = [n.get('excitability', 0.5) for n in nodes]
-            node_feat = [
-                np.mean(voltages),
-                np.mean(firing_rates),
-                np.mean(excitabilities),
-            ]
-        else:
-            node_feat = [0.0, 0.0, 0.5]
-
-        if edges:
-            weights = [e.get('weight', 0.5) for e in edges]
-            ages = [e.get('age', 0.0) for e in edges]
-            synapse_feat = [np.mean(weights), np.mean(ages)]
-        else:
-            synapse_feat = [0.5, 0.0]
-
-        n_nodes = max(len(nodes), 1)
-        n_edges = len(edges)
-        max_edges = n_nodes * (n_nodes - 1)
-        density = n_edges / max_edges if max_edges > 0 else 0.0
-        clustering = meta.get('clustering_coefficient', 0.0)
-        components = meta.get('connected_components', 1)
-        norm_components = min(components / max(n_nodes, 1), 1.0)
-        topo_feat = [density, clustering, norm_components]
-
-        if nodes:
-            recent = [n.get('recent_firing', 0.0) for n in nodes]
-            stdp = [n.get('stdp_timing', 0.0) for n in nodes]
-            temporal_feat = [
-                np.mean(recent), np.std(recent),
-                np.mean(stdp), np.std(stdp),
-            ]
-        else:
-            temporal_feat = [0.0, 0.0, 0.0, 0.0]
-
-        identity = meta.get('identity_embedding', None)
-        if identity is not None:
-            identity = np.array(identity, dtype=np.float32)[:384]
-            if len(identity) < 384:
-                identity = np.pad(identity, (0, 384 - len(identity)))
-        else:
-            identity = np.zeros(384, dtype=np.float32)
-
-        return {
-            'node_features': _torch.tensor([node_feat], dtype=_torch.float32),
-            'synapse_features': _torch.tensor([synapse_feat], dtype=_torch.float32),
-            'topo_features': _torch.tensor([topo_feat], dtype=_torch.float32),
-            'temporal_features': _torch.tensor([temporal_feat], dtype=_torch.float32),
-            'identity_embedding': _torch.from_numpy(identity.reshape(1, -1)),
-        }

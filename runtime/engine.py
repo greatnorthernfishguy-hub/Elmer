@@ -644,11 +644,14 @@ class ElmerEngine:
         self._brain_drain_running = True
 
         def _drain_loop():
+            import time as _time
+            _cycle_interval = 60.0  # seconds between brain cycles
+
             while self._brain_drain_running:
                 snapshot = None
                 context = None
 
-                # Grab the latest snapshot (if any)
+                # Check for conversation-driven snapshot first
                 with self._brain_buffer_lock:
                     if self._brain_latest_snapshot is not None:
                         snapshot = self._brain_latest_snapshot
@@ -657,14 +660,26 @@ class ElmerEngine:
                         self._brain_latest_context = None
 
                 if snapshot is not None:
+                    # Conversation active — process all sockets with snapshot
                     try:
                         self._process_brain_sockets_kissed(snapshot, context, [])
                     except Exception as exc:
                         logger.warning("Brain drain error: %s", exc)
+                    _time.sleep(1.0)
                 else:
-                    # No new data — sleep briefly before checking again
-                    import time
-                    time.sleep(1.0)
+                    # No conversation — run brain sockets anyway.
+                    # ProtoUniBrain reads from the River (BTF tract) directly.
+                    # The River always has fresh topology from the Tonic.
+                    try:
+                        from core.base_socket import GraphSnapshot
+                        empty_snapshot = GraphSnapshot(nodes=[], edges=[], metadata={})
+                        empty_context = {"autonomic_state": "PARASYMPATHETIC"}
+                        self._process_brain_sockets_kissed(
+                            empty_snapshot, empty_context, []
+                        )
+                    except Exception as exc:
+                        logger.debug("Brain idle cycle error: %s", exc)
+                    _time.sleep(_cycle_interval)
 
         self._brain_drain_thread = threading.Thread(
             target=_drain_loop,
