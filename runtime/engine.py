@@ -820,35 +820,33 @@ class ElmerEngine:
             logger.warning("Brain drain processing error: %s", exc)
 
     def _log_competence_delta(self, frozen_output: SocketOutput, proto_output: SocketOutput) -> None:
-        """Log the signal delta between frozen and proto brains.
+        """Log intrinsic quality metrics for ProtoUniBrain.
 
-        The delta IS the competence measure. As proto evolves via Lenia:
-          - Shrinking delta = proto converging toward frozen (learning)
-          - Growing delta = proto diverging (exploring or degrading)
-          - Signal-specific deltas show WHERE proto differs
+        Splat-Lenia research finding: measuring distance from a frozen
+        reference causes oscillation. The dynamics find their OWN equilibrium.
+        Quality is measured by what the model DOES, not by distance from
+        something frozen.
+
+        Metrics (from splat research):
+          - output_norm: signal magnitude (should be non-trivial, not collapsed)
+          - entropy: signal diversity (high = differentiated, low = collapsed)
+          - variance: signal spread (should be > 0, not all same value)
+          - range: max-min across signals (0 = all identical, bad)
+          - extremity: how many signals are saturated (< 0.05 or > 0.95)
+
+        The frozen brain's signals are logged for reference but NOT used
+        as a target. ProtoUniBrain is its own organism.
         """
         try:
-            import json, os
+            import json, os, math
             from datetime import datetime
 
             delta_path = os.path.expanduser("~/.elmer/competence_delta.jsonl")
             os.makedirs(os.path.dirname(delta_path), exist_ok=True)
 
-            frozen_sig = frozen_output.signal
             proto_sig = proto_output.signal
+            frozen_sig = frozen_output.signal
 
-            # Extract signal values
-            frozen_vals = {
-                'coherence': frozen_sig.coherence_score,
-                'health': frozen_sig.health_score,
-                'anomaly': frozen_sig.anomaly_level,
-                'novelty': frozen_sig.novelty,
-                'confidence': frozen_sig.confidence,
-                'severity': frozen_sig.severity,
-                'identity_coherence': frozen_sig.identity_coherence,
-                'pruning_pressure': frozen_sig.pruning_pressure,
-                'topology_health': frozen_sig.topology_health,
-            }
             proto_vals = {
                 'coherence': proto_sig.coherence_score,
                 'health': proto_sig.health_score,
@@ -860,41 +858,71 @@ class ElmerEngine:
                 'pruning_pressure': proto_sig.pruning_pressure,
                 'topology_health': proto_sig.topology_health,
             }
+            frozen_vals = {
+                'coherence': frozen_sig.coherence_score,
+                'health': frozen_sig.health_score,
+                'anomaly': frozen_sig.anomaly_level,
+                'novelty': frozen_sig.novelty,
+                'confidence': frozen_sig.confidence,
+                'severity': frozen_sig.severity,
+                'identity_coherence': frozen_sig.identity_coherence,
+                'pruning_pressure': frozen_sig.pruning_pressure,
+                'topology_health': frozen_sig.topology_health,
+            }
 
-            # Per-signal delta (proto - frozen)
-            deltas = {k: round(proto_vals[k] - frozen_vals[k], 6) for k in frozen_vals}
+            vals = list(proto_vals.values())
+            n = len(vals)
 
-            # L2 norm of the delta vector — single number for overall divergence
-            import math
-            l2_norm = round(math.sqrt(sum(d ** 2 for d in deltas.values())), 6)
+            # Intrinsic quality metrics
+            output_norm = round(math.sqrt(sum(v ** 2 for v in vals)), 6)
+            mean_val = sum(vals) / n
+            variance = round(sum((v - mean_val) ** 2 for v in vals) / n, 6)
+            val_range = round(max(vals) - min(vals), 6)
 
-            # Lenia metadata from proto
+            # Entropy: how differentiated are the signals?
+            # Treat as soft probability distribution via softmax-like normalization
+            shifted = [v - min(vals) + 0.001 for v in vals]  # avoid log(0)
+            total = sum(shifted)
+            probs = [s / total for s in shifted]
+            entropy = round(-sum(p * math.log(p + 1e-12) for p in probs), 6)
+
+            # Extremity: how many signals are saturated?
+            saturated = sum(1 for v in vals if v < 0.05 or v > 0.95)
+
+            # Lenia metadata
             proto_meta = proto_sig.metadata or {}
             lenia_step = proto_meta.get('lenia_step', 0)
             lenia_delta_norm = proto_meta.get('lenia_delta_norm', 0)
+            lenia_time_ms = proto_meta.get('lenia_time_ms', 0)
 
             entry = {
                 'timestamp': datetime.now().isoformat(),
                 'lenia_step': lenia_step,
-                'l2_divergence': l2_norm,
-                'frozen_confidence': frozen_output.confidence,
-                'proto_confidence': proto_output.confidence,
-                'deltas': deltas,
-                'frozen_signals': {k: round(v, 6) for k, v in frozen_vals.items()},
+                # Intrinsic quality (what the model DOES)
+                'output_norm': output_norm,
+                'entropy': entropy,
+                'variance': variance,
+                'signal_range': val_range,
+                'saturated_signals': saturated,
+                # Raw signals (for trajectory analysis)
                 'proto_signals': {k: round(v, 6) for k, v in proto_vals.items()},
+                # Frozen reference (NOT a target — just context)
+                'frozen_signals': {k: round(v, 6) for k, v in frozen_vals.items()},
+                # Lenia state
                 'lenia_delta_norm': lenia_delta_norm,
+                'lenia_time_ms': round(lenia_time_ms, 1),
             }
 
             with open(delta_path, 'a') as f:
                 f.write(json.dumps(entry) + '\n')
 
             logger.info(
-                "Competence delta: L2=%.4f, lenia_step=%d, lenia_weight_delta=%.6f",
-                l2_norm, lenia_step, lenia_delta_norm,
+                "Living brain: norm=%.3f entropy=%.3f var=%.4f range=%.3f sat=%d step=%d delta=%.6f",
+                output_norm, entropy, variance, val_range, saturated, lenia_step, lenia_delta_norm,
             )
 
         except Exception as exc:
-            logger.debug("Competence delta logging failed: %s", exc)
+            logger.debug("Competence logging failed: %s", exc)
 
     # -----------------------------------------------------------------
     # Health  (PRD §14)
