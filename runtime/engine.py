@@ -812,6 +812,10 @@ class ElmerEngine:
                 except Exception as exc:
                     logger.warning("Brain drain: elmer:proto_unibrain error: %s", exc)
 
+            # Run decoder bucket: read proto's River deposit, extract signals
+            if proto_output:
+                proto_output = self._run_decoder_bucket(proto_output)
+
             # Log competence delta
             if frozen_output and proto_output:
                 self._log_competence_delta(frozen_output, proto_output)
@@ -819,7 +823,123 @@ class ElmerEngine:
         except Exception as exc:
             logger.warning("Brain drain processing error: %s", exc)
 
-    def _log_competence_delta(self, frozen_output: SocketOutput, proto_output: SocketOutput) -> None:
+    # -----------------------------------------------------------------
+    # Decoder Bucket — reads ProtoUniBrain's River deposit
+    # -----------------------------------------------------------------
+
+    def _run_decoder_bucket(self, proto_output: SocketOutput) -> SocketOutput:
+        """Read ProtoUniBrain's raw deposit from the River, extract signals.
+
+        The decoder is a bucket — a River consumer, not a model layer.
+        It reads the latent state ProtoUniBrain deposited and produces
+        human-readable signals for Elmer's use.
+        """
+        try:
+            import os, torch, numpy as np
+
+            tract_path = os.path.expanduser(
+                "~/.et_modules/tracts/proto_unibrain/latent.tract"
+            )
+            if not os.path.exists(tract_path):
+                return proto_output  # no deposit yet
+
+            # Read latest deposit from the tract
+            import ng_tract
+            file_size = os.path.getsize(tract_path)
+            if file_size == 0:
+                return proto_output
+
+            # Read tail of tract for latest entry
+            chunk_size = 65536  # 64KB — latent is ~28KB
+            offset = max(0, file_size - chunk_size)
+            with open(tract_path, "rb") as f:
+                if offset > 0:
+                    f.seek(offset)
+                data = f.read()
+
+            # Find valid BTF start if we seeked
+            if offset > 0:
+                magic_pos = data.find(b"BT")
+                if magic_pos >= 0:
+                    data = data[magic_pos:]
+
+            # Find latest experience entry
+            reader = ng_tract.TractReader(data)
+            latest = None
+            for entry in reader:
+                if isinstance(entry, bytes):
+                    latest = entry  # experience entries return raw bytes
+
+            if latest is None:
+                return proto_output
+
+            # Reconstruct tensor from raw bytes
+            hidden = np.frombuffer(latest, dtype=np.float32)
+            # Reshape: should be (seq_len, hidden_size) where hidden_size=896
+            hidden_size = 896
+            if len(hidden) % hidden_size != 0:
+                return proto_output
+            seq_len = len(hidden) // hidden_size
+            hidden_tensor = torch.from_numpy(
+                hidden.reshape(1, seq_len, hidden_size).copy()
+            )
+
+            # Run decoder (from frozen brain's loaded weights)
+            decoder = None
+            for socket_id in ["elmer:brain"]:
+                sock = self._socket_manager.get(socket_id)
+                if sock and hasattr(sock, '_brain') and sock._brain is not None:
+                    decoder = getattr(sock._brain, 'decoder', None)
+                    break
+
+            if decoder is None:
+                return proto_output
+
+            with torch.no_grad():
+                decoded = decoder(hidden_tensor)
+
+            # Build SocketOutput from decoded signals
+            from core.substrate_signal import SubstrateSignal
+            from core.base_socket import SocketOutput
+
+            signals = decoded['signals'][0].tolist()
+            actions = decoded['actions'][0].tolist()
+            signal_names = decoded['signal_names']
+            action_names = decoded['action_names']
+            sig = {n: v for n, v in zip(signal_names, signals)}
+            act = {n: v for n, v in zip(action_names, actions)}
+
+            # Carry over lenia metadata from proto's output
+            proto_meta = proto_output.signal.metadata or {}
+
+            return SocketOutput(
+                signal=SubstrateSignal.create(
+                    signal_type="coherence",
+                    description="ProtoUniBrain (decoder bucket)",
+                    coherence_score=sig.get('coherence', 0.5),
+                    health_score=sig.get('health', 0.5),
+                    anomaly_level=sig.get('anomaly', 0.5),
+                    novelty=sig.get('novelty', 0.5),
+                    confidence=sig.get('confidence', 0.5),
+                    severity=sig.get('severity', 0.5),
+                    identity_coherence=sig.get('identity_coherence', 0.5),
+                    pruning_pressure=sig.get('pruning_pressure', 0.5),
+                    topology_health=sig.get('topology_health', 0.5),
+                    metadata={
+                        **proto_meta,
+                        "socket": "elmer:proto_unibrain:decoder_bucket",
+                        "actions": act,
+                    },
+                ),
+                confidence=sig.get('confidence', 0.5),
+                processing_time=proto_output.processing_time,
+            )
+
+        except Exception as exc:
+            logger.debug("Decoder bucket failed: %s", exc)
+            return proto_output
+
+        def _log_competence_delta(self, frozen_output: SocketOutput, proto_output: SocketOutput) -> None:
         """Log intrinsic quality metrics for ProtoUniBrain.
 
         Splat-Lenia research finding: measuring distance from a frozen

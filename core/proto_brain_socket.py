@@ -193,8 +193,8 @@ class ProtoUniBrainSocket(ElmerSocket):
                     param.requires_grad = True
 
             # Attach Lenia dynamics engine — operates on EVERYTHING:
-            # body (transformer), encoder (the eyes), decoder (the voice).
-            # Lenia reshapes how the model reads AND writes, not just thinks.
+            # body (transformer) + encoder (the eyes).
+            # Decoder is decoupled — it's a River bucket, not a model layer.
             self._lenia = _lenia_module.LeniaEngine(
                 self._brain.transformer_body,
                 _lenia_module.LeniaConfig(
@@ -207,15 +207,8 @@ class ProtoUniBrainSocket(ElmerSocket):
                     activation_coupling=2.0,
                 ),
                 encoder=getattr(self._brain, 'encoder', None),
-                decoder=getattr(self._brain, 'decoder', None),
             )
             self._lenia.register_hooks()
-
-            # Replace sigmoid with ScaledTanh in the living brain's decoder.
-            # Sigmoid saturates — weight changes from Lenia don't move the
-            # output. ScaledTanh has a wider linear region: the living brain
-            # can breathe. The frozen brain keeps its sigmoid (stable reference).
-            self._swap_decoder_activation()
 
             self._brain.eval()
             self._loaded = True
@@ -252,11 +245,13 @@ class ProtoUniBrainSocket(ElmerSocket):
         logger.info("ProtoUniBrain unloaded")
 
     def process(self, snapshot: GraphSnapshot, context: dict) -> SocketOutput:
-        """Read topology from the River, run forward pass, apply Lenia dynamics.
+        """Read River, run forward pass, deposit raw hidden state back to River.
 
-        The River is the input. The encoder is the bucket. No bridges,
-        no _peer_events, no snapshot passthrough. Binary topology delta
-        from BTF tract -> Rust feature extraction -> forward -> Lenia step.
+        Law 7: raw in, raw out. The model deposits its full hidden state
+        to the River as binary. No decoder in the loop. No signal schema.
+        The decoder bucket extracts signals separately.
+
+        The loop closes: River -> encoder -> transformer -> River.
         """
         if not self._loaded or self._brain is None:
             raise RuntimeError("ProtoUniBrain not loaded")
@@ -270,59 +265,56 @@ class ProtoUniBrainSocket(ElmerSocket):
             # Read latest topology delta from the River (BTF tract)
             latest_delta = self._read_river_delta()
 
-            # Forward pass — encoder extracts from topology delta (BTF fast path)
+            # Forward pass — get raw hidden state, NOT decoder output
             with _torch.no_grad():
-                output = self._brain(
+                inputs_embeds = self._brain.encoder(
                     topology_delta=latest_delta,
                     autonomic_state=autonomic,
                 )
+                body_output = self._brain.transformer_body(
+                    input_ids=None,
+                    inputs_embeds=inputs_embeds,
+                    use_cache=False,
+                )
+                # Raw hidden state — full sequence, no pooling, no decoder
+                raw_hidden = body_output.last_hidden_state  # (1, seq_len, 896)
+
+            # Deposit raw hidden state to River as binary
+            # Law 7: no classification, no reduction, no selection
+            self._deposit_to_river(raw_hidden)
 
             # Lenia dynamics step — THE LEARNING
             lenia_metrics = self._lenia.step()
             self._lenia_steps += 1
 
-            # 3b. Periodic persistence — save every 5 Lenia steps
+            # Periodic persistence
             if self._lenia_steps % 5 == 0 and self._lenia_steps > 0:
                 self.save_evolved_weights()
                 self.log_weight_stats()
 
-            # 4. Build signal from output
-            signals = output['signals'][0].tolist()
-            actions = output['actions'][0].tolist()
-            signal_names = output['signal_names']
-            action_names = output['action_names']
-            sig = {n: v for n, v in zip(signal_names, signals)}
-            act = {n: v for n, v in zip(action_names, actions)}
-
             elapsed = time.time() - start
             self._total_latency += elapsed
 
-            substrate_signal = SubstrateSignal.create(
-                signal_type="coherence",
-                description="ProtoUniBrain living assessment",
-                coherence_score=sig['coherence'],
-                health_score=sig['health'],
-                anomaly_level=sig['anomaly'],
-                novelty=sig['novelty'],
-                confidence=sig['confidence'],
-                severity=sig['severity'],
-                identity_coherence=sig['identity_coherence'],
-                pruning_pressure=sig['pruning_pressure'],
-                topology_health=sig['topology_health'],
-                metadata={
-                    "socket": "elmer:proto_unibrain",
-                    "actions": act,
-                    "inference_time_ms": elapsed * 1000,
-                    "lenia_step": self._lenia_steps,
-                    "lenia_delta_norm": lenia_metrics['total_delta_norm'],
-                    "lenia_time_ms": lenia_metrics['time_ms'],
-                    "model": "proto_unibrain_1.5b",
-                },
-            )
-
+            # Return minimal SocketOutput — the decoder bucket produces
+            # the real signals from the River deposit separately.
             return SocketOutput(
-                signal=substrate_signal,
-                confidence=sig['confidence'],
+                signal=SubstrateSignal.create(
+                    signal_type="coherence",
+                    description="ProtoUniBrain living deposit",
+                    coherence_score=0.5,  # neutral — decoder bucket overrides
+                    health_score=0.5,
+                    confidence=0.5,
+                    metadata={
+                        "socket": "elmer:proto_unibrain",
+                        "inference_time_ms": elapsed * 1000,
+                        "lenia_step": self._lenia_steps,
+                        "lenia_delta_norm": lenia_metrics['total_delta_norm'],
+                        "lenia_time_ms": lenia_metrics.get('time_ms', 0),
+                        "hidden_shape": list(raw_hidden.shape),
+                        "model": "proto_unibrain",
+                    },
+                ),
+                confidence=0.5,
                 processing_time=elapsed,
             )
 
@@ -348,6 +340,32 @@ class ProtoUniBrainSocket(ElmerSocket):
                 confidence=0.0,
                 processing_time=elapsed,
             )
+
+    def _deposit_to_river(self, hidden_state):
+        """Deposit raw hidden state to the River as BTF experience entry.
+
+        Full sequence tensor, no pooling, no reduction. Law 7.
+        The decoder bucket and any other consumer reads this.
+        """
+        try:
+            import ng_tract
+            # (1, seq_len, hidden_size) -> (seq_len, hidden_size) -> raw bytes
+            raw = hidden_state.squeeze(0).detach().cpu().numpy()
+            content_bytes = raw.tobytes()
+
+            # Deposit to latent tract
+            tract_dir = os.path.expanduser("~/.et_modules/tracts/proto_unibrain")
+            os.makedirs(tract_dir, exist_ok=True)
+            tract_path = os.path.join(tract_dir, "latent.tract")
+
+            ng_tract.deposit_experience(
+                source="proto_unibrain",
+                content_type="latent_state",
+                content=content_bytes,
+                tract_paths=[tract_path],
+            )
+        except Exception as exc:
+            logger.debug("River deposit failed: %s", exc)
 
     def set_ecosystem_ref(self, ecosystem):
         """Set reference to Elmer's own ecosystem. Called by engine after init."""
@@ -508,35 +526,6 @@ class ProtoUniBrainSocket(ElmerSocket):
             logger.debug("River read failed: %s", exc)
             return None
 
-    def _swap_decoder_activation(self):
-        """Replace Sigmoid with ScaledTanh in the decoder.
-
-        (tanh(x) + 1) / 2 maps to [0, 1] like sigmoid but with a much
-        wider linear region. Lenia weight changes produce proportional
-        output changes instead of being squashed flat.
-
-        Only affects ProtoUniBrain. The frozen brain keeps its sigmoid.
-        """
-        import torch.nn as _nn
-
-        class ScaledTanh(_nn.Module):
-            def forward(self, x):
-                return (_torch.tanh(x) + 1.0) / 2.0
-
-        decoder = getattr(self._brain, 'decoder', None)
-        if decoder is None:
-            return
-        swapped = 0
-        for name in ['signal_head', 'action_head']:
-            head = getattr(decoder, name, None)
-            if head is None or not isinstance(head, _nn.Sequential):
-                continue
-            for i, layer in enumerate(head):
-                if isinstance(layer, _nn.Sigmoid):
-                    head[i] = ScaledTanh()
-                    swapped += 1
-        if swapped:
-            logger.info("ProtoUniBrain: swapped %d Sigmoid -> ScaledTanh (wider linear region)", swapped)
 
     def health(self) -> SocketHealth:
         h = self._make_health("healthy" if self._loaded else "offline")
