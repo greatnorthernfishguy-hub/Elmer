@@ -192,7 +192,9 @@ class ProtoUniBrainSocket(ElmerSocket):
                 for param in self._brain.encoder.parameters():
                     param.requires_grad = True
 
-            # Attach Lenia dynamics engine
+            # Attach Lenia dynamics engine — operates on EVERYTHING:
+            # body (transformer), encoder (the eyes), decoder (the voice).
+            # Lenia reshapes how the model reads AND writes, not just thinks.
             self._lenia = _lenia_module.LeniaEngine(
                 self._brain.transformer_body,
                 _lenia_module.LeniaConfig(
@@ -204,6 +206,8 @@ class ProtoUniBrainSocket(ElmerSocket):
                     max_weight_delta=0.05,
                     activation_coupling=2.0,
                 ),
+                encoder=getattr(self._brain, 'encoder', None),
+                decoder=getattr(self._brain, 'decoder', None),
             )
             self._lenia.register_hooks()
 
