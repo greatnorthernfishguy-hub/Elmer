@@ -211,6 +211,12 @@ class ProtoUniBrainSocket(ElmerSocket):
             )
             self._lenia.register_hooks()
 
+            # Replace sigmoid with ScaledTanh in the living brain's decoder.
+            # Sigmoid saturates — weight changes from Lenia don't move the
+            # output. ScaledTanh has a wider linear region: the living brain
+            # can breathe. The frozen brain keeps its sigmoid (stable reference).
+            self._swap_decoder_activation()
+
             self._brain.eval()
             self._loaded = True
 
@@ -501,6 +507,36 @@ class ProtoUniBrainSocket(ElmerSocket):
         except Exception as exc:
             logger.debug("River read failed: %s", exc)
             return None
+
+    def _swap_decoder_activation(self):
+        """Replace Sigmoid with ScaledTanh in the decoder.
+
+        (tanh(x) + 1) / 2 maps to [0, 1] like sigmoid but with a much
+        wider linear region. Lenia weight changes produce proportional
+        output changes instead of being squashed flat.
+
+        Only affects ProtoUniBrain. The frozen brain keeps its sigmoid.
+        """
+        import torch.nn as _nn
+
+        class ScaledTanh(_nn.Module):
+            def forward(self, x):
+                return (_torch.tanh(x) + 1.0) / 2.0
+
+        decoder = getattr(self._brain, 'decoder', None)
+        if decoder is None:
+            return
+        swapped = 0
+        for name in ['signal_head', 'action_head']:
+            head = getattr(decoder, name, None)
+            if head is None or not isinstance(head, _nn.Sequential):
+                continue
+            for i, layer in enumerate(head):
+                if isinstance(layer, _nn.Sigmoid):
+                    head[i] = ScaledTanh()
+                    swapped += 1
+        if swapped:
+            logger.info("ProtoUniBrain: swapped %d Sigmoid -> ScaledTanh (wider linear region)", swapped)
 
     def health(self) -> SocketHealth:
         h = self._make_health("healthy" if self._loaded else "offline")
