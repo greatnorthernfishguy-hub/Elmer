@@ -275,9 +275,12 @@ class ProtoUniBrainSocket(ElmerSocket):
                     input_ids=None,
                     inputs_embeds=inputs_embeds,
                     use_cache=False,
+                    output_hidden_states=True,
                 )
                 # Raw hidden state — full sequence, no pooling, no decoder
                 raw_hidden = body_output.last_hidden_state  # (1, seq_len, 896)
+                # All layer hidden states for per-layer measurement
+                all_hidden = body_output.hidden_states  # tuple of (1, seq_len, 896) x 25
 
             # Deposit raw hidden state to River as binary
             # Law 7: no classification, no reduction, no selection
@@ -308,19 +311,41 @@ class ProtoUniBrainSocket(ElmerSocket):
             pos_entropy = float(-(_torch.log(pos_probs + 1e-12) * pos_probs).sum())
             near_zero = float((h.abs() < 0.01).float().mean())
 
-            # Raw values in metadata — the real data, unscaled
+            # Per-layer statistics — finer grained than whole-tensor aggregate
+            layer_stats = []
+            if all_hidden:
+                for i, lh in enumerate(all_hidden):
+                    lh_sq = lh.squeeze(0)  # (seq_len, 896)
+                    layer_stats.append({
+                        "layer": i,
+                        "mean": round(float(lh_sq.mean()), 6),
+                        "std": round(float(lh_sq.std()), 6),
+                        "norm": round(float(lh_sq.norm()), 4),
+                    })
+
+            # Summary: how much are layers diverging from each other?
+            if len(layer_stats) > 1:
+                means = [ls["mean"] for ls in layer_stats]
+                stds = [ls["std"] for ls in layer_stats]
+                norms = [ls["norm"] for ls in layer_stats]
+                layer_mean_spread = round(max(means) - min(means), 6)
+                layer_std_spread = round(max(stds) - min(stds), 6)
+                layer_norm_spread = round(max(norms) - min(norms), 4)
+            else:
+                layer_mean_spread = 0.0
+                layer_std_spread = 0.0
+                layer_norm_spread = 0.0
+
             raw_stats = {
                 "h_mean": round(h_mean, 6),
                 "h_std": round(h_std, 6),
                 "h_norm": round(h_norm, 4),
-                "h_min": round(float(h.min()), 6),
-                "h_max": round(float(h.max()), 6),
-                "pos_mean": round(pos_mean, 6),
-                "pos_std": round(pos_std, 6),
                 "pos_entropy": round(pos_entropy, 4),
                 "near_zero_frac": round(near_zero, 6),
-                "seq_len": h.shape[0],
-                "hidden_dim": h.shape[1],
+                "layer_mean_spread": layer_mean_spread,
+                "layer_std_spread": layer_std_spread,
+                "layer_norm_spread": layer_norm_spread,
+                "n_layers": len(layer_stats),
             }
 
             return SocketOutput(
@@ -329,15 +354,15 @@ class ProtoUniBrainSocket(ElmerSocket):
                     description="ProtoUniBrain living deposit",
                     # Signal fields carry raw stats — no [0,1] scaling.
                     # Consumers extract and scale via their own buckets.
-                    coherence_score=pos_entropy,
+                    coherence_score=pos_entropy,  # position diversity
                     health_score=h_std,
                     anomaly_level=abs(h_mean),
-                    novelty=pos_std,
+                    novelty=layer_std_spread,  # layer differentiation
                     confidence=h_norm,
                     severity=near_zero,
                     identity_coherence=pos_mean,
                     pruning_pressure=near_zero,
-                    topology_health=pos_mean,
+                    topology_health=layer_norm_spread,  # layer norm spread
                     metadata={
                         "socket": "elmer:proto_unibrain",
                         "inference_time_ms": elapsed * 1000,
