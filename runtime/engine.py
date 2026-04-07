@@ -939,7 +939,7 @@ class ElmerEngine:
             logger.debug("Decoder bucket failed: %s", exc)
             return proto_output
 
-        def _log_competence_delta(self, frozen_output: SocketOutput, proto_output: SocketOutput) -> None:
+    def _log_competence_delta(self, frozen_output: SocketOutput, proto_output: SocketOutput) -> None:
         """Log intrinsic quality metrics for ProtoUniBrain.
 
         Splat-Lenia research finding: measuring distance from a frozen
