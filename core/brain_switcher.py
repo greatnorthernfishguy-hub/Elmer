@@ -260,23 +260,28 @@ class BrainSwitcher:
             if _elmer_dir not in _sys.path:
                 _sys.path.insert(0, _elmer_dir)
 
-            # Load ElmerBrain (frozen reference) first — lightweight
-            try:
-                BrainSocket = self._brain_socket_cls
-                brain_socket = BrainSocket()
-                if self._ecosystem:
-                    brain_socket.set_ecosystem_ref(self._ecosystem)
-                _flog(f"BrainSocket created, model_path={brain_socket._model_path}")
-                self._socket_manager.register(brain_socket)
-                ok_brain = brain_socket.load("models/brain")
-                _flog(f"BrainSocket.load() returned {ok_brain}")
-                if not ok_brain:
-                    logger.error("ElmerBrain failed to load")
-                    self._socket_manager.unregister(brain_socket.socket_id)
-            except Exception as exc:
-                import traceback
-                _flog(f"ElmerBrain EXCEPTION: {exc}\n{traceback.format_exc()}")
-                logger.error("ElmerBrain activation failed: %s", exc)
+            # Load ElmerBrain (frozen reference) — skip if disabled
+            if self._brain_socket_cls is None:
+                ok_brain = True  # not needed, proto is solo
+                _flog("Frozen brain disabled — proto solo")
+                logger.info("Frozen brain disabled — ProtoUniBrain solo")
+            else:
+                try:
+                    BrainSocket = self._brain_socket_cls
+                    brain_socket = BrainSocket()
+                    if self._ecosystem:
+                        brain_socket.set_ecosystem_ref(self._ecosystem)
+                    _flog(f"BrainSocket created, model_path={brain_socket._model_path}")
+                    self._socket_manager.register(brain_socket)
+                    ok_brain = brain_socket.load("models/brain")
+                    _flog(f"BrainSocket.load() returned {ok_brain}")
+                    if not ok_brain:
+                        logger.error("ElmerBrain failed to load")
+                        self._socket_manager.unregister(brain_socket.socket_id)
+                except Exception as exc:
+                    import traceback
+                    _flog(f"ElmerBrain EXCEPTION: {exc}\n{traceback.format_exc()}")
+                    logger.error("ElmerBrain activation failed: %s", exc)
 
             # Load ProtoUniBrain (living, Lenia dynamics)
             try:
@@ -296,9 +301,17 @@ class BrainSwitcher:
                 _flog(f"ProtoUniBrain EXCEPTION: {exc}\n{traceback.format_exc()}")
                 logger.warning("ProtoUniBrain activation failed: %s", exc)
 
-            if ok_brain and ok_proto:
+            if ok_proto and self._brain_socket_cls is None:
+                self._active_brain = "proto_only"
+                logger.info("ProtoUniBrain solo — living brain active")
+                self._offer_body_to_tonic()
+            elif ok_brain and ok_proto:
                 self._active_brain = "both"
                 logger.info("Both brains active (frozen + living)")
+                self._offer_body_to_tonic()
+            elif ok_proto:
+                self._active_brain = "proto_only"
+                logger.info("ProtoUniBrain only")
                 self._offer_body_to_tonic()
             elif ok_brain:
                 self._active_brain = "elmer_brain"
@@ -311,6 +324,10 @@ class BrainSwitcher:
 
     def _shed_proto_unibrain(self):
         """Shed ProtoUniBrain to free resources, keep ElmerBrain."""
+        if self._brain_socket_cls is None:
+            # Proto is solo — no frozen brain to fall back to. Don't shed.
+            logger.info("Proto solo mode — refusing to shed (no fallback)")
+            return
         with self._lock:
             self._revoke_body_from_tonic()
             try:

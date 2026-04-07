@@ -360,7 +360,7 @@ class ElmerEngine:
 
         self._brain_switcher = BrainSwitcher(
             self._socket_manager,
-            brain_socket_cls=BrainSocket,
+            brain_socket_cls=None,  # frozen brain disabled — proto solo
             proto_brain_socket_cls=ProtoUniBrainSocket,
             ecosystem=self._ecosystem,
         )
@@ -812,8 +812,8 @@ class ElmerEngine:
                 except Exception as exc:
                     logger.warning("Brain drain: elmer:proto_unibrain error: %s", exc)
 
-            # Log competence delta
-            if frozen_output and proto_output:
+            # Log competence metrics
+            if proto_output:
                 self._log_competence_delta(frozen_output, proto_output)
 
         except Exception as exc:
@@ -821,23 +821,11 @@ class ElmerEngine:
 
 
 
-    def _log_competence_delta(self, frozen_output: SocketOutput, proto_output: SocketOutput) -> None:
-        """Log intrinsic quality metrics for ProtoUniBrain.
+    def _log_competence_delta(self, frozen_output, proto_output: SocketOutput) -> None:
+        """Log intrinsic quality metrics for the living brain.
 
-        Splat-Lenia research finding: measuring distance from a frozen
-        reference causes oscillation. The dynamics find their OWN equilibrium.
-        Quality is measured by what the model DOES, not by distance from
-        something frozen.
-
-        Metrics (from splat research):
-          - output_norm: signal magnitude (should be non-trivial, not collapsed)
-          - entropy: signal diversity (high = differentiated, low = collapsed)
-          - variance: signal spread (should be > 0, not all same value)
-          - range: max-min across signals (0 = all identical, bad)
-          - extremity: how many signals are saturated (< 0.05 or > 0.95)
-
-        The frozen brain's signals are logged for reference but NOT used
-        as a target. ProtoUniBrain is its own organism.
+        Quality is measured by what the model DOES, not by distance
+        from something frozen. Frozen output may be None (proto solo mode).
         """
         try:
             import json, os, math
@@ -847,7 +835,7 @@ class ElmerEngine:
             os.makedirs(os.path.dirname(delta_path), exist_ok=True)
 
             proto_sig = proto_output.signal
-            frozen_sig = frozen_output.signal
+            frozen_sig = frozen_output.signal if frozen_output else None
 
             proto_vals = {
                 'coherence': proto_sig.coherence_score,
@@ -860,17 +848,19 @@ class ElmerEngine:
                 'pruning_pressure': proto_sig.pruning_pressure,
                 'topology_health': proto_sig.topology_health,
             }
-            frozen_vals = {
-                'coherence': frozen_sig.coherence_score,
-                'health': frozen_sig.health_score,
-                'anomaly': frozen_sig.anomaly_level,
-                'novelty': frozen_sig.novelty,
-                'confidence': frozen_sig.confidence,
-                'severity': frozen_sig.severity,
-                'identity_coherence': frozen_sig.identity_coherence,
-                'pruning_pressure': frozen_sig.pruning_pressure,
-                'topology_health': frozen_sig.topology_health,
-            }
+            frozen_vals = {}
+            if frozen_sig:
+                frozen_vals = {
+                    'coherence': frozen_sig.coherence_score,
+                    'health': frozen_sig.health_score,
+                    'anomaly': frozen_sig.anomaly_level,
+                    'novelty': frozen_sig.novelty,
+                    'confidence': frozen_sig.confidence,
+                    'severity': frozen_sig.severity,
+                    'identity_coherence': frozen_sig.identity_coherence,
+                    'pruning_pressure': frozen_sig.pruning_pressure,
+                    'topology_health': frozen_sig.topology_health,
+                }
 
             vals = list(proto_vals.values())
             n = len(vals)
