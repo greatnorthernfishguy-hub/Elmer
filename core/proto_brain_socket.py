@@ -295,54 +295,60 @@ class ProtoUniBrainSocket(ElmerSocket):
             elapsed = time.time() - start
             self._total_latency += elapsed
 
-            # Real values from the raw hidden state — not classified into
-            # a named schema, but actual statistics of what the brain produced.
-            # The SubstrateSignal fields are filled with real tensor metrics,
-            # not arbitrary classifications.
+            # Raw statistics from the hidden state. No scaling, no clamping.
+            # The brain reports what it produced. Buckets scale to their needs.
             h = raw_hidden.squeeze(0)  # (seq_len, 896)
             h_mean = float(h.mean())
             h_std = float(h.std())
             h_norm = float(h.norm())
-            h_min = float(h.min())
-            h_max = float(h.max())
-            # Per-position activation: how alive is each sequence position?
             pos_norms = h.norm(dim=-1)  # (seq_len,)
             pos_mean = float(pos_norms.mean())
             pos_std = float(pos_norms.std())
-            # Entropy of the activation distribution across positions
             pos_probs = _torch.softmax(pos_norms, dim=0)
             pos_entropy = float(-(_torch.log(pos_probs + 1e-12) * pos_probs).sum())
+            near_zero = float((h.abs() < 0.01).float().mean())
+
+            # Raw values in metadata — the real data, unscaled
+            raw_stats = {
+                "h_mean": round(h_mean, 6),
+                "h_std": round(h_std, 6),
+                "h_norm": round(h_norm, 4),
+                "h_min": round(float(h.min()), 6),
+                "h_max": round(float(h.max()), 6),
+                "pos_mean": round(pos_mean, 6),
+                "pos_std": round(pos_std, 6),
+                "pos_entropy": round(pos_entropy, 4),
+                "near_zero_frac": round(near_zero, 6),
+                "seq_len": h.shape[0],
+                "hidden_dim": h.shape[1],
+            }
 
             return SocketOutput(
                 signal=SubstrateSignal.create(
                     signal_type="coherence",
                     description="ProtoUniBrain living deposit",
-                    # Fill signal fields with real values from the hidden state.
-                    # These are tensor statistics, not classifications.
-                    coherence_score=min(1.0, max(0.0, pos_entropy / 3.0)),  # normalized entropy
-                    health_score=min(1.0, max(0.0, h_std * 5.0)),  # weight diversity
-                    anomaly_level=min(1.0, max(0.0, abs(h_mean) * 10.0)),  # drift from zero-centered
-                    novelty=min(1.0, max(0.0, pos_std / (pos_mean + 1e-6))),  # position variance ratio
-                    confidence=min(1.0, max(0.0, h_norm / (h.shape[0] * h.shape[1]) * 100)),  # normalized magnitude
-                    severity=0.0,
-                    identity_coherence=min(1.0, max(0.0, 1.0 - pos_std / (pos_mean + 1e-6))),  # inverse of novelty
-                    pruning_pressure=min(1.0, max(0.0, float((h.abs() < 0.01).float().mean()))),  # near-zero fraction
-                    topology_health=min(1.0, max(0.0, pos_mean / 10.0)),  # mean activation strength
+                    # Signal fields carry raw stats — no [0,1] scaling.
+                    # Consumers extract and scale via their own buckets.
+                    coherence_score=pos_entropy,
+                    health_score=h_std,
+                    anomaly_level=abs(h_mean),
+                    novelty=pos_std,
+                    confidence=h_norm,
+                    severity=near_zero,
+                    identity_coherence=pos_mean,
+                    pruning_pressure=near_zero,
+                    topology_health=pos_mean,
                     metadata={
                         "socket": "elmer:proto_unibrain",
                         "inference_time_ms": elapsed * 1000,
                         "lenia_step": self._lenia_steps,
                         "lenia_delta_norm": lenia_metrics['total_delta_norm'],
                         "lenia_time_ms": lenia_metrics.get('time_ms', 0),
-                        "hidden_shape": list(raw_hidden.shape),
-                        "h_mean": round(h_mean, 6),
-                        "h_std": round(h_std, 6),
-                        "h_norm": round(h_norm, 4),
-                        "pos_entropy": round(pos_entropy, 4),
                         "model": "proto_unibrain",
+                        "raw": raw_stats,
                     },
                 ),
-                confidence=min(1.0, max(0.0, h_norm / (h.shape[0] * h.shape[1]) * 100)),
+                confidence=h_norm,
                 processing_time=elapsed,
             )
 
