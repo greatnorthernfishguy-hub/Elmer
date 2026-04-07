@@ -182,6 +182,22 @@ class ElmerHook(OpenClawAdapter):
                     with open("/tmp/elmer_eager.log", "a") as _f:
                         _f.write(f"[{__import__('datetime').datetime.now()}] Delayed brain load starting (fan-out context)...\n")
                     self._engine.load_brains()
+
+                    # Wire Tonic engine to BrainSwitcher — direct reference,
+                    # no threads, no timers, no hunting through globals.
+                    try:
+                        import neurograph_rpc
+                        mem = getattr(neurograph_rpc, '_memory', None)
+                        if mem:
+                            tonic = getattr(mem, '_tonic_thread', None)
+                            if tonic:
+                                tonic_engine = getattr(tonic, '_latent_engine', None)
+                                if tonic_engine:
+                                    self._engine.set_tonic_engine(tonic_engine)
+                                    logger.info("Tonic wired to BrainSwitcher — hot-swap active")
+                    except Exception as exc:
+                        logger.debug("Tonic wiring failed (non-critical): %s", exc)
+
                     with open("/tmp/elmer_eager.log", "a") as _f:
                         _f.write(f"[{__import__('datetime').datetime.now()}] Delayed brain load SUCCEEDED\n")
                 except Exception as exc:
