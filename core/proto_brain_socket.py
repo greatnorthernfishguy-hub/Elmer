@@ -295,15 +295,39 @@ class ProtoUniBrainSocket(ElmerSocket):
             elapsed = time.time() - start
             self._total_latency += elapsed
 
-            # Return minimal SocketOutput — the decoder bucket produces
-            # the real signals from the River deposit separately.
+            # Real values from the raw hidden state — not classified into
+            # a named schema, but actual statistics of what the brain produced.
+            # The SubstrateSignal fields are filled with real tensor metrics,
+            # not arbitrary classifications.
+            h = raw_hidden.squeeze(0)  # (seq_len, 896)
+            h_mean = float(h.mean())
+            h_std = float(h.std())
+            h_norm = float(h.norm())
+            h_min = float(h.min())
+            h_max = float(h.max())
+            # Per-position activation: how alive is each sequence position?
+            pos_norms = h.norm(dim=-1)  # (seq_len,)
+            pos_mean = float(pos_norms.mean())
+            pos_std = float(pos_norms.std())
+            # Entropy of the activation distribution across positions
+            pos_probs = _torch.softmax(pos_norms, dim=0)
+            pos_entropy = float(-(_torch.log(pos_probs + 1e-12) * pos_probs).sum())
+
             return SocketOutput(
                 signal=SubstrateSignal.create(
                     signal_type="coherence",
                     description="ProtoUniBrain living deposit",
-                    coherence_score=0.5,  # neutral — decoder bucket overrides
-                    health_score=0.5,
-                    confidence=0.5,
+                    # Fill signal fields with real values from the hidden state.
+                    # These are tensor statistics, not classifications.
+                    coherence_score=min(1.0, max(0.0, pos_entropy / 3.0)),  # normalized entropy
+                    health_score=min(1.0, max(0.0, h_std * 5.0)),  # weight diversity
+                    anomaly_level=min(1.0, max(0.0, abs(h_mean) * 10.0)),  # drift from zero-centered
+                    novelty=min(1.0, max(0.0, pos_std / (pos_mean + 1e-6))),  # position variance ratio
+                    confidence=min(1.0, max(0.0, h_norm / (h.shape[0] * h.shape[1]) * 100)),  # normalized magnitude
+                    severity=0.0,
+                    identity_coherence=min(1.0, max(0.0, 1.0 - pos_std / (pos_mean + 1e-6))),  # inverse of novelty
+                    pruning_pressure=min(1.0, max(0.0, float((h.abs() < 0.01).float().mean()))),  # near-zero fraction
+                    topology_health=min(1.0, max(0.0, pos_mean / 10.0)),  # mean activation strength
                     metadata={
                         "socket": "elmer:proto_unibrain",
                         "inference_time_ms": elapsed * 1000,
@@ -311,10 +335,14 @@ class ProtoUniBrainSocket(ElmerSocket):
                         "lenia_delta_norm": lenia_metrics['total_delta_norm'],
                         "lenia_time_ms": lenia_metrics.get('time_ms', 0),
                         "hidden_shape": list(raw_hidden.shape),
+                        "h_mean": round(h_mean, 6),
+                        "h_std": round(h_std, 6),
+                        "h_norm": round(h_norm, 4),
+                        "pos_entropy": round(pos_entropy, 4),
                         "model": "proto_unibrain",
                     },
                 ),
-                confidence=0.5,
+                confidence=min(1.0, max(0.0, h_norm / (h.shape[0] * h.shape[1]) * 100)),
                 processing_time=elapsed,
             )
 
