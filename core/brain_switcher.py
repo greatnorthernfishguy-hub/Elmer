@@ -93,7 +93,7 @@ class BrainSwitcher:
         if self._tonic_engine is None:
             return
         try:
-            proto = self._socket_manager.get("elmer:proto_unibrain")
+            proto = self._socket_manager.get_socket("elmer:proto_unibrain")
             if proto and getattr(proto, '_loaded', False) and getattr(proto, '_brain', None):
                 body = getattr(proto._brain, 'transformer_body', None)
                 if body is not None:
