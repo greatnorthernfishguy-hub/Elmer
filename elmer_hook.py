@@ -186,17 +186,27 @@ class ElmerHook(OpenClawAdapter):
                     # Wire Tonic engine to BrainSwitcher — direct reference,
                     # no threads, no timers, no hunting through globals.
                     try:
-                        import neurograph_rpc
-                        mem = getattr(neurograph_rpc, '_memory', None)
+                        import sys as _sys
+                        main_mod = _sys.modules.get('__main__')
+                        mem = getattr(main_mod, '_memory', None)
+                        logger.info("Tonic wiring: _memory=%s", type(mem).__name__ if mem else None)
                         if mem:
                             tonic = getattr(mem, '_tonic_thread', None)
+                            logger.info("Tonic wiring: _tonic_thread=%s", type(tonic).__name__ if tonic else None)
                             if tonic:
                                 tonic_engine = getattr(tonic, '_latent_engine', None)
+                                logger.info("Tonic wiring: _latent_engine=%s", type(tonic_engine).__name__ if tonic_engine else None)
                                 if tonic_engine:
                                     self._engine.set_tonic_engine(tonic_engine)
                                     logger.info("Tonic wired to BrainSwitcher — hot-swap active")
+                                else:
+                                    logger.warning("Tonic wiring: _latent_engine is None")
+                            else:
+                                logger.warning("Tonic wiring: _tonic_thread is None")
+                        else:
+                            logger.warning("Tonic wiring: _memory is None")
                     except Exception as exc:
-                        logger.debug("Tonic wiring failed (non-critical): %s", exc)
+                        logger.warning("Tonic wiring failed: %s", exc)
 
                     with open("/tmp/elmer_eager.log", "a") as _f:
                         _f.write(f"[{__import__('datetime').datetime.now()}] Delayed brain load SUCCEEDED\n")
