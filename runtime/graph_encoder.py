@@ -97,7 +97,7 @@ class GraphEncoder:
         target_id = f"{signal.signal_type}:{signal.module_id}"
 
         return {
-            "embedding": embedding.tolist(),
+            "embedding": embedding,
             "target_id": target_id,
             "metadata": {
                 "signal_id": signal.signal_id,
@@ -109,15 +109,13 @@ class GraphEncoder:
         }
 
     def _embed(self, text: str) -> np.ndarray:
-        """Hash-based deterministic embedding (testing fallback).
+        """Embed via ng_embed (ecosystem standard).
 
-        Production: replace with fastembed or Ollama.
+        Snowflake/snowflake-arctic-embed-m-v1.5, 768-dim, ONNX.
+        Falls back to zero vector if embedding fails.
         """
-        h = hashlib.sha256(text.encode()).digest()
-        repeats = (self._embedding_dim * 4 // len(h)) + 1
-        raw = np.frombuffer((h * repeats)[: self._embedding_dim * 4], dtype=np.float32)
-        vec = raw[: self._embedding_dim]
-        norm = np.linalg.norm(vec)
-        if norm > 1e-12:
-            vec = vec / norm
-        return vec
+        try:
+            from ng_embed import embed
+            return embed(text, normalize=True)
+        except Exception:
+            return np.zeros(self._embedding_dim, dtype=np.float32)
