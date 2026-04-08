@@ -38,6 +38,17 @@ Competence Model — Continuous, Not Tiered:
     topology already encodes the successful tuning patterns.
 
 # ---- Changelog ----
+# [2026-04-08] Claude Code (Opus 4.6) — Punchlist #55: CES attention tuning
+#   What: Added diagnostic logic for surfacing_decay_rate, surfacing_min_confidence,
+#     prediction_window in _diagnose_and_recommend().
+#   Why:  Temporal stuttering — stale context persists across turns. CES attention
+#     params now in TUNABLE_PARAMS (ng_lite.py). Elmer needs diagnostic rules to
+#     drive tuning decisions. Bootstrap heuristic: attention staleness correlates
+#     with weight saturation + over-utilization. Competence refines over time as
+#     #56 outcome data accumulates.
+#   How:  attention_sticky / attention_sparse flags from existing health metrics.
+#     Sticky → lower decay rate, raise min_confidence, shorten prediction_window.
+#     Sparse → opposite. Same _propose_adjustment() pattern, same competence model.
 # [2026-03-26] Claude Code Opus — Punchlist #44: Adaptive relevance thresholds
 #   What: Added relevance_threshold to TuningSocket's monitored parameters
 #   Why: Punchlist #44 — peer bridge relevance_threshold should adapt based on
@@ -555,6 +566,68 @@ class TuningSocket(ElmerSocket):
             )
             if rec:
                 recommendations.append(rec)
+
+        # --- CES attention dynamics (Punchlist #55) ---
+        # When the substrate is saturated (high weight + high utilization),
+        # attention is too sticky — concepts persist too long in the
+        # surfacing queue and prediction window. Lower decay rate (faster
+        # fade), raise confidence floor, shorten prediction window.
+        # When the substrate is sparse, attention may be too aggressive —
+        # nudge in the opposite direction.
+        #
+        # Bootstrap heuristic: attention staleness correlates with weight
+        # saturation and over-utilization. As #56 outcome data accumulates,
+        # competence grows and the substrate refines these judgments.
+        attention_sticky = avg_weight > w_hi and node_util > u_hi
+        attention_sparse = avg_weight < w_lo and node_util < u_lo
+
+        if attention_sticky:
+            if "surfacing_decay_rate" in tunables:
+                rec = self._propose_adjustment(
+                    "surfacing_decay_rate", tunables["surfacing_decay_rate"], direction=-1,
+                    reason=f"attention sticky (avg_weight {avg_weight:.3f} > {w_hi:.3f}, "
+                           f"util {node_util:.3f} > {u_hi:.3f}) — faster decay",
+                )
+                if rec:
+                    recommendations.append(rec)
+            if "surfacing_min_confidence" in tunables:
+                rec = self._propose_adjustment(
+                    "surfacing_min_confidence", tunables["surfacing_min_confidence"], direction=1,
+                    reason=f"attention sticky — raise confidence floor",
+                )
+                if rec:
+                    recommendations.append(rec)
+            if "prediction_window" in tunables:
+                rec = self._propose_adjustment(
+                    "prediction_window", tunables["prediction_window"], direction=-1,
+                    reason=f"attention sticky — shorten prediction window",
+                )
+                if rec:
+                    recommendations.append(rec)
+
+        elif attention_sparse:
+            if "surfacing_decay_rate" in tunables:
+                rec = self._propose_adjustment(
+                    "surfacing_decay_rate", tunables["surfacing_decay_rate"], direction=1,
+                    reason=f"attention sparse (avg_weight {avg_weight:.3f} < {w_lo:.3f}, "
+                           f"util {node_util:.3f} < {u_lo:.3f}) — slower decay",
+                )
+                if rec:
+                    recommendations.append(rec)
+            if "surfacing_min_confidence" in tunables:
+                rec = self._propose_adjustment(
+                    "surfacing_min_confidence", tunables["surfacing_min_confidence"], direction=-1,
+                    reason=f"attention sparse — lower confidence floor",
+                )
+                if rec:
+                    recommendations.append(rec)
+            if "prediction_window" in tunables:
+                rec = self._propose_adjustment(
+                    "prediction_window", tunables["prediction_window"], direction=1,
+                    reason=f"attention sparse — lengthen prediction window",
+                )
+                if rec:
+                    recommendations.append(rec)
 
         return recommendations
 
