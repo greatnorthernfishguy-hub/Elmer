@@ -75,6 +75,7 @@ class BrainSwitcher:
         self._monitor_thread: Optional[threading.Thread] = None
         self._running = False
         self._lock = threading.Lock()
+        self._body_lock = threading.Lock()  # shared by proto + Tonic
         self._tonic_engine = None  # set via set_tonic_engine()
 
     def set_tonic_engine(self, engine):
@@ -98,6 +99,7 @@ class BrainSwitcher:
                 body = getattr(proto._brain, 'transformer_body', None)
                 if body is not None:
                     self._tonic_engine.offer_shared_body(body)
+                    self._tonic_engine.set_body_lock(self._body_lock)
         except Exception as exc:
             logger.debug("Failed to offer body to Tonic: %s", exc)
 
@@ -290,6 +292,7 @@ class BrainSwitcher:
                 if self._ecosystem:
                     proto_socket.set_ecosystem_ref(self._ecosystem)
                 _flog(f"ProtoUniBrainSocket created, model_path={proto_socket._model_path}")
+                proto_socket.set_body_lock(self._body_lock)
                 self._socket_manager.register(proto_socket)
                 ok_proto = proto_socket.load("models/proto_brain")
                 _flog(f"ProtoUniBrainSocket.load() returned {ok_proto}")

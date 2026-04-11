@@ -123,6 +123,11 @@ class ProtoUniBrainSocket(ElmerSocket):
         self._config = None
         self._lenia_steps = 0
         self._ecosystem = ecosystem
+        self._body_lock = None
+
+    def set_body_lock(self, lock) -> None:
+        """Set the shared body access lock (from BrainSwitcher)."""
+        self._body_lock = lock
 
     @property
     def socket_id(self) -> str:
@@ -204,7 +209,7 @@ class ProtoUniBrainSocket(ElmerSocket):
                     growth_sigma=0.02,
                     growth_scale=0.005,
                     max_weight_delta=0.05,
-                    activation_coupling=2.0,
+                    activation_coupling=0.5,
                 ),
                 encoder=getattr(self._brain, 'encoder', None),
             )
@@ -265,30 +270,37 @@ class ProtoUniBrainSocket(ElmerSocket):
             # Read latest topology delta from the River (BTF tract)
             latest_delta = self._read_river_delta()
 
-            # Forward pass — get raw hidden state, NOT decoder output
-            with _torch.no_grad():
-                inputs_embeds = self._brain.encoder(
-                    topology_delta=latest_delta,
-                    autonomic_state=autonomic,
-                )
-                body_output = self._brain.transformer_body(
-                    input_ids=None,
-                    inputs_embeds=inputs_embeds,
-                    use_cache=False,
-                    output_hidden_states=True,
-                )
-                # Raw hidden state — full sequence, no pooling, no decoder
-                raw_hidden = body_output.last_hidden_state  # (1, seq_len, 896)
-                # All layer hidden states for per-layer measurement
-                all_hidden = body_output.hidden_states  # tuple of (1, seq_len, 896) x 25
+            # Serialize body access with Tonic — same physical memory.
+            # Both run in separate threads on the same tensor memory.
+            # One lock ensures they take turns — no concurrent reads/writes.
+            import contextlib
+            _body_ctx = self._body_lock if self._body_lock is not None else contextlib.nullcontext()
 
-            # Deposit raw hidden state to River as binary
-            # Law 7: no classification, no reduction, no selection
+            with _body_ctx:
+                # Forward pass — get raw hidden state, NOT decoder output
+                with _torch.no_grad():
+                    inputs_embeds = self._brain.encoder(
+                        topology_delta=latest_delta,
+                        autonomic_state=autonomic,
+                    )
+                    body_output = self._brain.transformer_body(
+                        input_ids=None,
+                        inputs_embeds=inputs_embeds,
+                        use_cache=False,
+                        output_hidden_states=True,
+                    )
+                    # Raw hidden state — full sequence, no pooling, no decoder
+                    raw_hidden = body_output.last_hidden_state  # (1, seq_len, 896)
+                    # All layer hidden states for per-layer measurement
+                    all_hidden = body_output.hidden_states  # tuple of (1, seq_len, 896) x 25
+
+                # Lenia dynamics step — THE LEARNING
+                # Must hold lock: writes to the same weight tensors Tonic reads
+                lenia_metrics = self._lenia.step()
+                self._lenia_steps += 1
+
+            # Deposit raw hidden state to River — outside lock, no body access
             self._deposit_to_river(raw_hidden)
-
-            # Lenia dynamics step — THE LEARNING
-            lenia_metrics = self._lenia.step()
-            self._lenia_steps += 1
 
             # Periodic persistence
             if self._lenia_steps % 5 == 0 and self._lenia_steps > 0:
