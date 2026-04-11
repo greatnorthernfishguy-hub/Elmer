@@ -62,7 +62,7 @@ _WEIGHT_STATS_LOG_PATH = os.path.expanduser("~/.elmer/weight_stats.jsonl")
 
 
 def _lazy_imports():
-    global _torch, _brain_module, _lenia_module, _encoder_module
+    global _torch, _brain_module, _lenia_module, _encoder_module, _splat_adapter_module
     if _torch is None:
         import torch
         _torch = torch
