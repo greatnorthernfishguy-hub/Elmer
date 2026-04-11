@@ -360,21 +360,26 @@ class ProtoUniBrainSocket(ElmerSocket):
                 "n_layers": len(layer_stats),
             }
 
+            # Normalize signal fields to (0, 1) at the boundary.
+            # Raw values preserved in metadata["raw"] for bucket consumers.
+            # tanh(x / scale): healthy state maps to ~0.3-0.7, saturates
+            # gracefully under explosion rather than emitting garbage values.
+            import math as _math
+            def _sig(x, scale): return float(_math.tanh(abs(x) / max(scale, 1e-9)))
+
             return SocketOutput(
                 signal=SubstrateSignal.create(
                     signal_type="coherence",
                     description="ProtoUniBrain living deposit",
-                    # Signal fields carry raw stats — no [0,1] scaling.
-                    # Consumers extract and scale via their own buckets.
-                    coherence_score=pos_entropy,  # position diversity
-                    health_score=h_std,
-                    anomaly_level=abs(h_mean),
-                    novelty=layer_std_spread,  # layer differentiation
-                    confidence=h_norm,
-                    severity=near_zero,
-                    identity_coherence=pos_mean,
-                    pruning_pressure=near_zero,
-                    topology_health=layer_norm_spread,  # layer norm spread
+                    coherence_score=_sig(pos_entropy, 4.0),   # entropy of pos dist
+                    health_score=_sig(h_std, 2.0),             # hidden state spread
+                    anomaly_level=_sig(h_mean, 1.0),           # mean deviation from 0
+                    novelty=_sig(layer_std_spread, 1.0),        # layer differentiation
+                    confidence=_sig(h_norm, 50.0),              # output magnitude
+                    severity=float(near_zero),                  # already [0,1]
+                    identity_coherence=_sig(pos_mean, 30.0),    # per-position norm
+                    pruning_pressure=float(near_zero),          # already [0,1]
+                    topology_health=_sig(layer_norm_spread, 10.0),  # layer norm spread
                     metadata={
                         "socket": "elmer:proto_unibrain",
                         "inference_time_ms": elapsed * 1000,
@@ -385,7 +390,7 @@ class ProtoUniBrainSocket(ElmerSocket):
                         "raw": raw_stats,
                     },
                 ),
-                confidence=h_norm,
+                confidence=_sig(h_norm, 50.0),
                 processing_time=elapsed,
             )
 
