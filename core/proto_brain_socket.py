@@ -52,6 +52,7 @@ _torch = None
 _brain_module = None
 _lenia_module = None
 _encoder_module = None
+_splat_adapter_module = None
 
 # Persistence paths — proto brain survives restarts
 _PROTO_WEIGHTS_PATH = os.path.expanduser("~/.elmer/proto_weights.pt")
@@ -98,6 +99,20 @@ def _lazy_imports():
         _lenia_module = ilu.module_from_spec(spec)
         _sys.modules["lenia_engine"] = _lenia_module
         spec.loader.exec_module(_lenia_module)
+    if _splat_adapter_module is None:
+        try:
+            import importlib.util as ilu3
+            import sys as _sys3
+            spec = ilu3.spec_from_file_location(
+                "splat_adapter",
+                os.path.expanduser("~/UniAI/lenia/splat_adapter.py"),
+            )
+            _splat_adapter_module = ilu3.module_from_spec(spec)
+            _sys3.modules["splat_adapter"] = _splat_adapter_module
+            spec.loader.exec_module(_splat_adapter_module)
+        except Exception as e:
+            logger.warning("SplatAdapter import failed (non-fatal): %s", e)
+            _splat_adapter_module = None
 
 
 class ProtoUniBrainSocket(ElmerSocket):
@@ -120,8 +135,10 @@ class ProtoUniBrainSocket(ElmerSocket):
         )
         self._brain = None  # unified ElmerBrain with GraphEncoder
         self._lenia = None
+        self._splat_adapter = None
         self._config = None
         self._lenia_steps = 0
+        self._splat_step_count = 0
         self._ecosystem = ecosystem
         self._body_lock = None
 
@@ -215,6 +232,33 @@ class ProtoUniBrainSocket(ElmerSocket):
             )
             self._lenia.register_hooks()
 
+            # Attach SplatAdapter — myelin layer via Gaussian splat dynamics.
+            # Uses the same ng_tract.LeniaEngine as the dense Lenia engine.
+            # Phase 1: dynamics run, metrics logged. Contribution to forward pass in Phase 2.
+            if _splat_adapter_module is not None:
+                try:
+                    rust_engine = self._lenia._rust_engine  # the ng_tract.LeniaEngine instance
+                    splat_cfg = _splat_adapter_module.SplatAdapterConfig(
+                        myelin_splats_per_layer=64,
+                        init_sigma=0.15,
+                        init_amp=0.05,
+                    )
+                    self._splat_adapter = _splat_adapter_module.SplatAdapter(splat_cfg, rust_engine)
+                    # Register splat populations for transformer body layers
+                    n_registered = 0
+                    for name, param in self._brain.transformer_body.named_parameters():
+                        if param.dim() == 2 and 'weight' in name:
+                            rows, cols = param.shape
+                            self._splat_adapter.register_layer(name, rows, cols)
+                            n_registered += 1
+                    logger.info(
+                        "ProtoUniBrain: SplatAdapter registered %d layers (%d myelin splats each)",
+                        n_registered, splat_cfg.myelin_splats_per_layer
+                    )
+                except Exception as e:
+                    logger.warning("SplatAdapter init failed (non-fatal): %s", e)
+                    self._splat_adapter = None
+
             self._brain.eval()
             self._loaded = True
 
@@ -244,6 +288,7 @@ class ProtoUniBrainSocket(ElmerSocket):
             self._lenia.remove_hooks()
         self._brain = None
         self._lenia = None
+        self._splat_adapter = None
         self._config = None
         self._loaded = False
         gc.collect()
@@ -298,6 +343,44 @@ class ProtoUniBrainSocket(ElmerSocket):
                 # Must hold lock: writes to the same weight tensors Tonic reads
                 lenia_metrics = self._lenia.step()
                 self._lenia_steps += 1
+
+            # Splat adapter step — runs OUTSIDE the body lock.
+            # Splat arrays are separate from transformer weight tensors.
+            # No shared memory with Tonic — no lock needed.
+            if self._splat_adapter is not None and self._lenia_steps % 5 == 0:
+                try:
+                    # Feed per-layer activation magnitudes from this forward pass
+                    if all_hidden and len(all_hidden) > 0:
+                        layer_activations = {}
+                        for name, _ in self._brain.transformer_body.named_parameters():
+                            if 'weight' in name:
+                                # Approximate activation for this layer from hidden norms
+                                # Layer index from name: "layers.N.xxx"
+                                parts = name.split('.')
+                                layer_idx = None
+                                for p in parts:
+                                    try:
+                                        layer_idx = int(p)
+                                        break
+                                    except ValueError:
+                                        pass
+                                if layer_idx is not None and layer_idx < len(all_hidden):
+                                    lh = all_hidden[layer_idx].squeeze(0)
+                                    layer_activations[name] = float(lh.norm() / max(lh.numel() ** 0.5, 1.0))
+                        self._splat_adapter.update_activations(layer_activations)
+                    splat_metrics = self._splat_adapter.step()
+                    self._splat_step_count += 1
+                    if self._splat_step_count % 10 == 0:
+                        stats = self._splat_adapter.get_stats()
+                        logger.debug(
+                            "SplatAdapter step %d: myelin_active=%d drift=%.6f high_amp=%d",
+                            self._splat_step_count,
+                            splat_metrics.get('myelin_active', 0),
+                            splat_metrics.get('total_drift', 0.0),
+                            splat_metrics.get('high_amp_splats', 0),
+                        )
+                except Exception as e:
+                    logger.warning("SplatAdapter step failed (non-fatal): %s", e)
 
             # Deposit raw hidden state to River — outside lock, no body access
             self._deposit_to_river(raw_hidden)
