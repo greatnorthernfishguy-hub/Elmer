@@ -251,6 +251,8 @@ class ProtoUniBrainSocket(ElmerSocket):
                             rows, cols = param.shape
                             self._splat_adapter.register_layer(name, rows, cols)
                             n_registered += 1
+                    # Register forward hooks — myelin contribution added on every forward pass
+                    self._splat_adapter.register_forward_hooks(self._brain.transformer_body)
                     logger.info(
                         "ProtoUniBrain: SplatAdapter registered %d layers (%d myelin splats each)",
                         n_registered, splat_cfg.myelin_splats_per_layer
@@ -286,6 +288,8 @@ class ProtoUniBrainSocket(ElmerSocket):
             self.log_weight_stats()
         if self._lenia:
             self._lenia.remove_hooks()
+        if self._splat_adapter is not None:
+            self._splat_adapter.remove_hooks()
         self._brain = None
         self._lenia = None
         self._splat_adapter = None
