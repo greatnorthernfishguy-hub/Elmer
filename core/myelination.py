@@ -195,10 +195,16 @@ class MyelinationSocket(ElmerSocket):
         if len(peer_events) < _MIN_EVENTS_TO_RECOMMEND:
             return {}
 
-        # Count events per peer
+        # Count events per peer.
+        # _peer_events may contain typed BTF entries (PyTopologyEntry etc.)
+        # or legacy dicts depending on whether the BTF path is active.
         counts: Dict[str, int] = {}
         for event in peer_events:
-            mid = event.get("module_id", "")
+            mid = (
+                event.get("module_id", "")
+                if isinstance(event, dict)
+                else getattr(event, "module_id", "")
+            )
             if mid:
                 counts[mid] = counts.get(mid, 0) + 1
 
