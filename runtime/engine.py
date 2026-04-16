@@ -6,6 +6,11 @@ and the autonomic monitor.  Receives raw input, builds GraphSnapshots,
 routes through sockets, chains pipelines, and returns SocketOutputs.
 
 # ---- Changelog ----
+# [2026-04-16] Claude Code (Sonnet 4.6) — Disable ElmerBrain in standalone path
+# What: brain_socket_cls=None in start() to match load_brains() proto-solo behavior
+# Why:  Standalone start path was loading ElmerBrain even after it was intentionally
+#       disabled. NEUROGRAPH_FANOUT_CONTEXT not set = standalone = ElmerBrain back.
+# How:  Match load_brains() — brain_socket_cls=None, proto is the solo runner.
 # [2026-03-28] Claude Code (Opus 4.6) — Encoder v2 wiring corrected
 # What: Removed context['graph'] pass-through. Brain sockets read Elmer's
 #   own local NG-Lite directly via ecosystem ref set during start().
@@ -250,7 +255,7 @@ class ElmerEngine:
             try:
                 self._brain_switcher = BrainSwitcher(
                     self._socket_manager,
-                    brain_socket_cls=BrainSocket,
+                    brain_socket_cls=None,  # ElmerBrain disabled — proto solo
                     proto_brain_socket_cls=ProtoUniBrainSocket,
                     ecosystem=self._ecosystem,
                 )
