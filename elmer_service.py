@@ -21,6 +21,14 @@ with dedicated resources for brain processing.
 #   How:  FastAPI + uvicorn. Tract drain loop on background thread.
 #         Engine starts with full brains (skip_brains=False). KISS + brain
 #         buffer from engine. Health/status/process endpoints.
+# [2026-04-15] Claude Code (Sonnet 4.6) — Punchlist #137: Fix bridge.drain() no-op
+#   What: Replace bridge.drain() / bridge.read_tract() branches with
+#         bridge.sync_state() in the tract drain loop.
+#   Why:  NGTractBridge has no public drain() method. hasattr guard silently
+#         skipped the entire tract drain — drain loop was a no-op for River.
+#   How:  sync_state(local_state={}, module_id="elmer") calls _drain_all()
+#         internally, clearing tracts and updating bridge state. Text extraction
+#         loop removed — Law 7 violation deferred to punchlist #154.
 # -------------------
 """
 
@@ -86,30 +94,8 @@ def _drain_loop():
         try:
             if _engine and _engine._started and _engine._ecosystem:
                 bridge = getattr(_engine._ecosystem, '_peer_bridge', None)
-                if bridge and hasattr(bridge, 'drain'):
-                    events = bridge.drain()
-                    if events:
-                        for event in events:
-                            # Extract text content from topology delta
-                            text = _extract_text_from_delta(event)
-                            if text:
-                                try:
-                                    _engine.process_text(text)
-                                except Exception as exc:
-                                    logger.warning("Drain process error: %s", exc)
-                        logger.debug("Drained %d events from tract", len(events))
-                elif bridge and hasattr(bridge, 'read_tract'):
-                    # Try alternate drain method
-                    for peer_id in _get_peer_ids(bridge):
-                        events = bridge.read_tract(peer_id)
-                        if events:
-                            for event in events:
-                                text = _extract_text_from_delta(event)
-                                if text:
-                                    try:
-                                        _engine.process_text(text)
-                                    except Exception as exc:
-                                        logger.warning("Drain process error: %s", exc)
+                if bridge and hasattr(bridge, 'sync_state'):
+                    bridge.sync_state(local_state={}, module_id="elmer")
         except Exception as exc:
             logger.warning("Tract drain error: %s", exc)
 
