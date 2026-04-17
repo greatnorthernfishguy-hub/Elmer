@@ -15,6 +15,20 @@ Decision factors:
   - Autonomic state (SYMPATHETIC = stay light, PARASYMPATHETIC = go heavy)
 
 # ---- Changelog ----
+# [2026-04-16] Claude (Sonnet 4.6) — #159: Multi-tonic BrainSwitcher
+#   What: _tonic_engine (single) -> _tonic_engines (list). register_tonic_engine(),
+#          _offer_body_to_single(), _write_proto_body_status(), _get_lock_file_path().
+#          set_tonic_engine() kept as backward-compat shim.
+#          Writes ~/.et_modules/elmer/proto_body_status.json on ProtoUniBrain load/shed.
+#   Why:  CC's Tonic (in-process via cc_ng_host.py) can share ProtoUniBrain's
+#         transformer body. Both Tonics use the same threading._body_lock.
+#         fcntl.LOCK_SH file lock enforces read-only invariant cross-process:
+#         any future writer must hold LOCK_EX, blocking all inference.
+#         One CC, one time — architecture is the guardrail, not documentation.
+#   How:  register_tonic_engine() appends to list, offers body immediately if
+#         proto already loaded. _body_lock_context() in TonicEngine composes
+#         threading.Lock + fcntl.flock. neurograph_rpc.py registers CC's Tonic
+#         after cc_ng_host.init_cc_host().
 # [2026-03-25] Claude Code (Opus 4.6) — Initial implementation
 #   What: Resource-aware brain switching
 #   Why:  Can't run both brains simultaneously on 16GB VPS
@@ -76,41 +90,104 @@ class BrainSwitcher:
         self._running = False
         self._lock = threading.Lock()
         self._body_lock = threading.Lock()  # shared by proto + Tonic
-        self._tonic_engine = None  # set via set_tonic_engine()
+        self._tonic_engines = []  # list of registered Tonic engines — see register_tonic_engine()
 
-    def set_tonic_engine(self, engine):
-        """Give BrainSwitcher a reference to the TonicEngine.
+    def set_tonic_engine(self, engine) -> None:
+        """Backward-compatible shim — calls register_tonic_engine()."""
+        self.register_tonic_engine(engine)
 
-        When ProtoUniBrain loads/unloads, the switcher offers/revokes
-        the shared transformer body. The Tonic hot-swaps without stopping.
+    def register_tonic_engine(self, engine) -> None:
+        """Register a TonicEngine to share ProtoUniBrain's transformer body.
+
+        All registered engines receive the body when ProtoUniBrain loads
+        and are revoked when it sheds. The same _body_lock (threading.Lock)
+        is passed to all engines for in-process serialization; the cross-
+        process flock lock file path is also passed via set_lock_file().
+
+        Idempotent — re-registering the same engine is a no-op.
         """
-        self._tonic_engine = engine
-        # If proto is already loaded, offer immediately
-        if self._active_brain in ("both", "proto_unibrain"):
-            self._offer_body_to_tonic()
+        if engine in self._tonic_engines:
+            return
+        self._tonic_engines.append(engine)
+        # If proto is already loaded, offer immediately to the new engine
+        if self._active_brain in ("both", "proto_unibrain", "proto_only"):
+            self._offer_body_to_single(engine)
 
-    def _offer_body_to_tonic(self):
-        """Offer ProtoUniBrain's body to the Tonic engine."""
-        if self._tonic_engine is None:
+    def _offer_body_to_single(self, engine) -> None:
+        """Offer ProtoUniBrain body to one specific engine (late registration)."""
+        try:
+            proto = self._socket_manager.get_socket("elmer:proto_unibrain")
+            if proto and getattr(proto, '_loaded', False) and getattr(proto, '_brain', None):
+                body = getattr(proto._brain, 'transformer_body', None)
+                if body is not None:
+                    engine.offer_shared_body(body)
+                    engine.set_body_lock(self._body_lock)
+                    lock_path = self._get_lock_file_path()
+                    if lock_path:
+                        engine.set_lock_file(lock_path)
+        except Exception as exc:
+            logger.debug("Failed to offer body to single engine: %s", exc)
+
+    def _offer_body_to_tonic(self) -> None:
+        """Offer ProtoUniBrain's body to all registered Tonic engines."""
+        if not self._tonic_engines:
             return
         try:
             proto = self._socket_manager.get_socket("elmer:proto_unibrain")
             if proto and getattr(proto, '_loaded', False) and getattr(proto, '_brain', None):
                 body = getattr(proto._brain, 'transformer_body', None)
                 if body is not None:
-                    self._tonic_engine.offer_shared_body(body)
-                    self._tonic_engine.set_body_lock(self._body_lock)
+                    lock_path = self._get_lock_file_path()
+                    for engine in self._tonic_engines:
+                        try:
+                            engine.offer_shared_body(body)
+                            engine.set_body_lock(self._body_lock)
+                            if lock_path:
+                                engine.set_lock_file(lock_path)
+                        except Exception as exc:
+                            logger.debug("Failed to offer body to engine: %s", exc)
         except Exception as exc:
-            logger.debug("Failed to offer body to Tonic: %s", exc)
+            logger.debug("Failed to offer body to Tonic engines: %s", exc)
 
-    def _revoke_body_from_tonic(self):
-        """Tell Tonic to reload its own body — ProtoUniBrain being shed."""
-        if self._tonic_engine is None:
-            return
+    def _revoke_body_from_tonic(self) -> None:
+        """Tell all Tonic engines to reload their own body — ProtoUniBrain shedding."""
+        for engine in self._tonic_engines:
+            try:
+                engine.revoke_shared_body()
+                engine.set_lock_file(None)
+            except Exception as exc:
+                logger.debug("Failed to revoke body from engine: %s", exc)
+
+    def _get_lock_file_path(self) -> str:
+        """Return the path to the cross-process body access lock file."""
+        return os.path.expanduser("~/.et_modules/elmer/proto_body.lock")
+
+    def _write_proto_body_status(self, available: bool) -> None:
+        """Write or remove the proto body coordination file.
+
+        Writes ~/.et_modules/elmer/proto_body_status.json when ProtoUniBrain
+        is loaded so in-process and future cross-process Tonic consumers can
+        discover the body and lock file path. Removes the file when shed.
+        """
+        status_path = os.path.expanduser("~/.et_modules/elmer/proto_body_status.json")
+        lock_path = self._get_lock_file_path()
         try:
-            self._tonic_engine.revoke_shared_body()
+            if available:
+                import json as _json
+                os.makedirs(os.path.dirname(status_path), exist_ok=True)
+                # Ensure lock file exists — flock works on any file
+                open(lock_path, 'a').close()
+                with open(status_path, 'w') as _f:
+                    _json.dump({
+                        "available": True,
+                        "lock": lock_path,
+                        "loaded_at": time.time(),
+                    }, _f)
+            else:
+                if os.path.exists(status_path):
+                    os.remove(status_path)
         except Exception as exc:
-            logger.debug("Failed to revoke body from Tonic: %s", exc)
+            logger.debug("Failed to update proto body status: %s", exc)
 
     @property
     def active_brain(self) -> str:
@@ -323,6 +400,10 @@ class BrainSwitcher:
                 self._active_brain = "none"
                 logger.error("No brain sockets loaded")
 
+            # Write coordination file when proto is part of active configuration
+            if self._active_brain in ("both", "proto_unibrain", "proto_only"):
+                self._write_proto_body_status(True)
+
             self._last_switch_time = time.time()
 
     def _shed_proto_unibrain(self):
@@ -333,6 +414,7 @@ class BrainSwitcher:
             return
         with self._lock:
             self._revoke_body_from_tonic()
+            self._write_proto_body_status(False)
             try:
                 self._socket_manager.unregister("elmer:proto_unibrain")
             except (ValueError, KeyError):
@@ -356,6 +438,7 @@ class BrainSwitcher:
                     self._last_switch_time = time.time()
                     logger.info("ProtoUniBrain restored — both brains active")
                     self._offer_body_to_tonic()
+                    self._write_proto_body_status(True)
                 else:
                     self._socket_manager.unregister(proto_socket.socket_id)
                     logger.warning("ProtoUniBrain restore failed")
