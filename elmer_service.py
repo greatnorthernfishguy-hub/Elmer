@@ -29,6 +29,14 @@ with dedicated resources for brain processing.
 #   How:  sync_state(local_state={}, module_id="elmer") calls _drain_all()
 #         internally, clearing tracts and updating bridge state. Text extraction
 #         loop removed — Law 7 violation deferred to punchlist #154.
+
+# [2026-04-18] Claude Code (Sonnet 4.6) — Punchlist #154: Remove dead _extract_text_from_delta; fix docstring
+#   What: Remove _extract_text_from_delta() — dead since #137 switched drain loop
+#         to sync_state(), which never invokes this function.
+#         Fix stale _drain_loop docstring claiming text extraction still occurs.
+#   Why:  Dead code creates confusion and suggests Law 7 violations that no longer
+#         exist. Docstring was factually wrong after the #137 fix.
+#   How:  Delete function body. Update docstring to match actual sync_state() flow.
 # -------------------
 """
 
@@ -80,11 +88,11 @@ _drain_running = False
 # ── Tract Drain ───────────────────────────────────────────────────
 
 def _drain_loop():
-    """Background loop that drains Elmer's tract and feeds the engine.
+    """Background loop that drains Elmer's tract via sync_state.
 
-    Reads topology deltas deposited by NeuroGraph via the River.
-    Each delta becomes a process_text() call — lightweight sockets
-    process synchronously, brain sockets via the async buffer.
+    Calls bridge.sync_state() which runs _drain_all() internally,
+    clearing incoming tracts and updating bridge state. No text
+    extraction — raw experience flows via the pulse loop (Law 7).
     """
     global _drain_running
 
@@ -102,40 +110,6 @@ def _drain_loop():
         time.sleep(TRACT_DRAIN_INTERVAL)
 
     logger.info("Tract drain loop stopped")
-
-
-def _extract_text_from_delta(event: Dict[str, Any]) -> Optional[str]:
-    """Extract processable text from a topology delta event.
-
-    Topology deltas from NeuroGraph contain fired nodes, synapse changes,
-    prediction results, etc. Convert to a text representation that the
-    sensory pipeline can process. The substrate receives this as raw
-    experience (Law 7).
-    """
-    parts = []
-
-    fired = event.get('fired_node_ids', [])
-    if fired:
-        parts.append(f"fired:{len(fired)} nodes")
-
-    fired_he = event.get('fired_hyperedge_ids', [])
-    if fired_he:
-        parts.append(f"hyperedges:{len(fired_he)} active")
-
-    pruned = event.get('synapses_pruned', 0)
-    sprouted = event.get('synapses_sprouted', 0)
-    if pruned or sprouted:
-        parts.append(f"structural:+{sprouted}/-{pruned}")
-
-    confirmed = event.get('predictions_confirmed', 0)
-    surprised = event.get('predictions_surprised', 0)
-    if confirmed or surprised:
-        parts.append(f"predictions:confirmed={confirmed},surprised={surprised}")
-
-    if not parts:
-        return None
-
-    return f"[topology_delta] {' | '.join(parts)}"
 
 
 def _get_peer_ids(bridge) -> list:

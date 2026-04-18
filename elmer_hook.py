@@ -62,6 +62,15 @@ stats() / health():
 #         threshold-aware health reporting.
 #   Why:  PRD v0.2.0 §7 mandates autonomic integration; §6.1 mandates
 #         flat scored signal fields; §9 mandates full pipeline chain.
+
+# [2026-04-18] Claude Code (Sonnet 4.6) — Punchlist #154: Fix Law 7 violation in pulse loop
+#   What: Replace text-extraction loop with raw embedding deposit to substrate.
+#         Remove _extract_pulse_text staticmethod (dead after this change).
+#   Why:  _pulse_cycle was calling process_text() with text extracted from topology
+#         deltas — classifying River events before substrate deposit, violating Law 7.
+#         Substrate must receive raw experience (embeddings), not extracted labels.
+#   How:  Snapshot _peer_events before drain, iterate new events, skip events without
+#         embeddings, deposit raw float32 embedding via record_outcome().
 # -------------------
 """
 
@@ -277,18 +286,21 @@ class ElmerHook(OpenClawAdapter):
         try:
             bridge = getattr(self._eco, '_peer_bridge', None) if hasattr(self, '_eco') else None
             if bridge and hasattr(bridge, '_drain_all'):
+                before = len(getattr(bridge, '_peer_events', []))
                 bridge._drain_all()
-                # Process newly drained events through the engine
                 peer_events = getattr(bridge, '_peer_events', [])
-                if peer_events:
-                    drained = len(peer_events)
-                    for event in peer_events:
-                        text = self._extract_pulse_text(event)
-                        if text and self._started:
-                            try:
-                                self._engine.process_text(text)
-                            except Exception as exc:
-                                logger.debug("Pulse drain process error: %s", exc)
+                new_events = peer_events[before:]
+                drained = len(new_events)
+                for event in new_events:
+                    if not isinstance(event, dict): continue
+                    raw_emb = event.get('embedding')
+                    if raw_emb is None: continue
+                    try:
+                        emb = np.asarray(raw_emb, dtype=np.float32)
+                        if self._eco:
+                            self._eco.record_outcome(emb, target_id="elmer:river_event", success=True, metadata={'source': 'river_pulse'})
+                    except Exception as exc:
+                        logger.debug("Pulse deposit error: %s", exc)
         except Exception as exc:
             logger.debug("Pulse drain error: %s", exc)
 
@@ -306,32 +318,6 @@ class ElmerHook(OpenClawAdapter):
                 )
             except Exception as exc:
                 logger.debug("Pulse topology pass error: %s", exc)
-
-    @staticmethod
-    def _extract_pulse_text(event):
-        """Extract processable text from a topology delta event.
-
-        Mirrors elmer_service.py _extract_text_from_delta — raw experience
-        from the River converted to text for the sensory pipeline (Law 7).
-        """
-        if not isinstance(event, dict):
-            return None
-        parts = []
-        fired = event.get('fired_node_ids', [])
-        if fired:
-            parts.append(f"fired:{len(fired)} nodes")
-        fired_he = event.get('fired_hyperedge_ids', [])
-        if fired_he:
-            parts.append(f"hyperedges:{len(fired_he)} active")
-        pruned = event.get('synapses_pruned', 0)
-        sprouted = event.get('synapses_sprouted', 0)
-        if pruned or sprouted:
-            parts.append(f"structural:+{sprouted}/-{pruned}")
-        confirmed = event.get('predictions_confirmed', 0)
-        surprised = event.get('predictions_surprised', 0)
-        if confirmed or surprised:
-            parts.append(f"predictions:confirmed={confirmed},surprised={surprised}")
-        return " ".join(parts) if parts else None
 
     def on_conversation_started(self):
         """Mode swap: shorter pulse interval during active conversation."""
