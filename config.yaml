@@ -22,7 +22,7 @@ sockets:
   health_check_interval: 30.0
   connect_timeout: 10.0
   default_priority: 5
-  neural_mode: true     # true = use trained ElmerBrain in sockets, false = heuristic stubs
+  neural_mode: false    # ElmerBrain disabled — proto is sole brain, heuristic stubs only
 
 # NG ecosystem (learning substrate)  (PRD §7)
 ng_ecosystem:
