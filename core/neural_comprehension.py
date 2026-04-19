@@ -1,16 +1,22 @@
 """
 Neural Comprehension Socket — Transformer-Powered Graph Reasoning  (PRD §5.2.3)
 
-Drop-in replacement for ComprehensionSocket that uses a surgically modified
-transformer (ElmerBrain) instead of heuristics. Same interface, same socket
-contract, but transformer-class pattern recognition under the hood.
+Drop-in replacement for ComprehensionSocket that uses ProtoUniBrain's living
+transformer body instead of heuristics. Same interface, same socket contract,
+but transformer-class pattern recognition under the hood.
 
-Loads the trained I/O weights from surgery/elmer_brain_v0.1.pt and
-reconstructs the full ElmerBrain (base model body + trained graph I/O).
-
-Falls back to heuristic mode if the trained weights aren't available.
+Brain is wired externally by BrainSwitcher after ProtoUniBrain loads — this
+socket never self-loads any model. Falls back to heuristics until brain arrives.
 
 # ---- Changelog ----
+# [2026-04-18] Claude Code (Sonnet 4.6) — Wire to ProtoUniBrain via BrainSwitcher
+#   What: Removed self-loading ElmerBrain. load() is now a no-op that starts in
+#         heuristic fallback. set_brain(brain) / revoke_brain() called by
+#         BrainSwitcher after proto loads/sheds. Zero duplicate transformer load.
+#   Why:  ElmerBrain is disabled. ProtoUniBrain is the sole brain. Heuristics are
+#         emergency fallback only.
+#   How:  BrainSwitcher._wire_neural_comprehension() calls set_brain(proto._brain)
+#         after _activate_both() succeeds. Same pattern as Tonic body-sharing.
 # [2026-03-20] Claude Code (Opus 4.6) — Initial implementation
 #   What: NeuralComprehensionSocket using ElmerBrain for inference
 #   Why:  PRD §5.2.3 socket 0 — Comprehension via harvested reasoning engine
@@ -23,7 +29,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 import time
 from typing import Any, Dict, Optional
 
@@ -76,66 +81,30 @@ class NeuralComprehensionSocket(ElmerSocket):
         )
 
     def load(self, model_path: str) -> bool:
-        """Load the trained ElmerBrain.
+        """Register socket. Brain wired later via set_brain() from BrainSwitcher.
 
-        Looks for trained I/O weights at surgery/elmer_brain_v0.1.pt.
-        If not found, falls back to heuristic mode.
+        Does NOT load its own model. Starts in heuristic fallback until
+        ProtoUniBrain's brain is offered via set_brain().
         """
         if self._loaded:
             return True
+        self._fallback_mode = True
+        self._loaded = True
+        self._load_time = time.time()
+        logger.info("NeuralComprehensionSocket ready — awaiting ProtoUniBrain body")
+        return True
 
-        # Find the surgery directory relative to the Elmer repo
-        repo_root = os.path.dirname(os.path.dirname(__file__))
-        weights_path = os.path.join(repo_root, 'surgery', 'elmer_brain_v0.1.pt')
+    def set_brain(self, brain) -> None:
+        """Wire ProtoUniBrain's brain. Called by BrainSwitcher after proto loads."""
+        self._brain = brain
+        self._fallback_mode = False
+        logger.info("NeuralComprehensionSocket wired to ProtoUniBrain — neural mode active")
 
-        if not os.path.exists(weights_path):
-            logger.warning(
-                "Trained weights not found at %s — running in fallback (heuristic) mode",
-                weights_path,
-            )
-            self._fallback_mode = True
-            self._loaded = True
-            self._load_time = time.time()
-            return True
-
-        try:
-            # Add surgery dir to path for imports
-            surgery_dir = os.path.join(repo_root, 'surgery')
-            if surgery_dir not in sys.path:
-                sys.path.insert(0, surgery_dir)
-
-            from operate import perform_surgery
-            from graph_io import GraphStateEncoder, GraphSignalDecoder
-
-            logger.info("Loading ElmerBrain (this loads the base transformer)...")
-            self._brain = perform_surgery(verbose=False)
-
-            # Load trained I/O weights
-            checkpoint = torch.load(weights_path, map_location='cpu', weights_only=True)
-            self._brain.encoder.load_state_dict(checkpoint['encoder_state'])
-            self._brain.decoder.load_state_dict(checkpoint['decoder_state'])
-            self._brain.eval()
-
-            config = checkpoint.get('config', {})
-            training = checkpoint.get('training', {})
-            logger.info(
-                "ElmerBrain loaded: base=%s, signal_loss=%.4f, action_loss=%.4f",
-                config.get('base_model', 'unknown'),
-                training.get('final_signal_loss', -1),
-                training.get('final_action_loss', -1),
-            )
-
-            self._fallback_mode = False
-            self._loaded = True
-            self._load_time = time.time()
-            return True
-
-        except Exception as exc:
-            logger.error("Failed to load ElmerBrain: %s — falling back to heuristics", exc)
-            self._fallback_mode = True
-            self._loaded = True
-            self._load_time = time.time()
-            return True
+    def revoke_brain(self) -> None:
+        """Revoke brain (proto shed). Fall back to heuristics."""
+        self._brain = None
+        self._fallback_mode = True
+        logger.info("NeuralComprehensionSocket brain revoked — heuristic fallback")
 
     def unload(self) -> None:
         """Release the model from memory."""

@@ -15,6 +15,13 @@ Decision factors:
   - Autonomic state (SYMPATHETIC = stay light, PARASYMPATHETIC = go heavy)
 
 # ---- Changelog ----
+# [2026-04-18] Claude Code (Sonnet 4.6) — Wire NeuralComprehensionSocket to ProtoUniBrain
+#   What: _wire_neural_comprehension() / _revoke_neural_comprehension() added.
+#         Called alongside _offer_body_to_tonic() in _activate_both(),
+#         _add_proto_unibrain(), and _shed_proto_unibrain().
+#   Why:  NeuralComprehensionSocket needs proto's full brain (encoder+body+decoder).
+#         ElmerBrain is disabled — zero separate transformer loads.
+#   How:  socket_manager.get_socket("elmer:neural_comprehension").set_brain(proto._brain)
 # [2026-04-16] Claude (Sonnet 4.6) — #159: Multi-tonic BrainSwitcher
 #   What: _tonic_engine (single) -> _tonic_engines (list). register_tonic_engine(),
 #          _offer_body_to_single(), _write_proto_body_status(), _get_lock_file_path().
@@ -157,6 +164,27 @@ class BrainSwitcher:
                 engine.set_lock_file(None)
             except Exception as exc:
                 logger.debug("Failed to revoke body from engine: %s", exc)
+
+    def _wire_neural_comprehension(self) -> None:
+        """Wire NeuralComprehensionSocket to ProtoUniBrain's brain after proto loads."""
+        try:
+            proto = self._socket_manager.get_socket("elmer:proto_unibrain")
+            if proto and getattr(proto, "_loaded", False) and getattr(proto, "_brain", None):
+                comp = self._socket_manager.get_socket("elmer:neural_comprehension")
+                if comp and hasattr(comp, "set_brain"):
+                    comp.set_brain(proto._brain)
+                    logger.info("NeuralComprehensionSocket wired to ProtoUniBrain")
+        except Exception as exc:
+            logger.debug("Failed to wire comprehension socket: %s", exc)
+
+    def _revoke_neural_comprehension(self) -> None:
+        """Revoke NeuralComprehensionSocket brain — proto shedding."""
+        try:
+            comp = self._socket_manager.get_socket("elmer:neural_comprehension")
+            if comp and hasattr(comp, "revoke_brain"):
+                comp.revoke_brain()
+        except Exception as exc:
+            logger.debug("Failed to revoke comprehension socket: %s", exc)
 
     def _get_lock_file_path(self) -> str:
         """Return the path to the cross-process body access lock file."""
@@ -385,14 +413,17 @@ class BrainSwitcher:
                 self._active_brain = "proto_only"
                 logger.info("ProtoUniBrain solo — living brain active")
                 self._offer_body_to_tonic()
+                self._wire_neural_comprehension()
             elif ok_brain and ok_proto:
                 self._active_brain = "both"
                 logger.info("Both brains active (frozen + living)")
                 self._offer_body_to_tonic()
+                self._wire_neural_comprehension()
             elif ok_proto:
                 self._active_brain = "proto_only"
                 logger.info("ProtoUniBrain only")
                 self._offer_body_to_tonic()
+                self._wire_neural_comprehension()
             elif ok_brain:
                 self._active_brain = "elmer_brain"
                 logger.info("ElmerBrain only (ProtoUniBrain unavailable)")
@@ -414,6 +445,7 @@ class BrainSwitcher:
             return
         with self._lock:
             self._revoke_body_from_tonic()
+            self._revoke_neural_comprehension()
             self._write_proto_body_status(False)
             try:
                 self._socket_manager.unregister("elmer:proto_unibrain")
@@ -438,6 +470,7 @@ class BrainSwitcher:
                     self._last_switch_time = time.time()
                     logger.info("ProtoUniBrain restored — both brains active")
                     self._offer_body_to_tonic()
+                    self._wire_neural_comprehension()
                     self._write_proto_body_status(True)
                 else:
                     self._socket_manager.unregister(proto_socket.socket_id)
