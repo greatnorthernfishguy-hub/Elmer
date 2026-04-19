@@ -147,11 +147,16 @@ class NeuralComprehensionSocket(ElmerSocket):
     def _neural_process(self, snapshot: GraphSnapshot, context: dict, t0: float) -> SocketOutput:
         """Process using the transformer brain."""
         try:
-            # graph_encoder.ElmerBrain takes snapshot= directly — no GraphFeatures conversion.
-            # Passing a GraphFeatures struct as positional arg hit topology_delta=, causing
-            # _read_global() to call .get() on a dataclass (fixed 2026-04-19).
+            # graph_encoder.ElmerBrain prefers a live graph object (per-node/hyperedge
+            # detail) over a flat GraphSnapshot (12 scalar averages). Engine puts the
+            # live NG-Lite instance in context["live_graph"]; fall back to snapshot= only
+            # if it's absent (e.g. in tests or before ecosystem initializes).
+            live_graph = context.get('live_graph')
             with torch.no_grad():
-                output = self._brain(snapshot=snapshot)
+                if live_graph is not None:
+                    output = self._brain(graph=live_graph)
+                else:
+                    output = self._brain(snapshot=snapshot)
 
             elapsed = time.time() - t0
             self._total_latency += elapsed

@@ -6,6 +6,11 @@ and the autonomic monitor.  Receives raw input, builds GraphSnapshots,
 routes through sockets, chains pipelines, and returns SocketOutputs.
 
 # ---- Changelog ----
+# [2026-04-19] Claude Code (Sonnet 4.6) — Wire live_graph into context for v2 encoder
+#   What: Added context["live_graph"] = self._ecosystem._graph (None-safe) to process().
+#   Why:  graph_encoder.ElmerBrain prefers graph= (per-node detail) over snapshot=
+#         (12 scalar averages). Comment block already documented the intent; code never did it.
+#   How:  Socket reads context["live_graph"] and passes graph= to brain; snapshot= fallback.
 # [2026-04-16] Claude Code (Sonnet 4.6) — Disable ElmerBrain in standalone path
 # What: brain_socket_cls=None in start() to match load_brains() proto-solo behavior
 # Why:  Standalone start path was loading ElmerBrain even after it was intentionally
@@ -430,6 +435,11 @@ class ElmerEngine:
             "autonomic_state": autonomic.get("state", "PARASYMPATHETIC"),
             "autonomic_intensity": autonomic.get("threat_level", "none"),
             "process_id": self._process_count,
+            # Live NG-Lite graph for v2 encoder (graph_encoder.ElmerBrain).
+            # Richer than a flat GraphSnapshot — per-node/hyperedge detail.
+            "live_graph": (self._ecosystem._graph
+                           if self._ecosystem and hasattr(self._ecosystem, '_graph')
+                           else None),
         }
 
         # Provide live substrate objects for v2 encoder (if ecosystem initialized)
