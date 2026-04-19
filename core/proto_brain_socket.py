@@ -9,6 +9,13 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-04-19] CC (punchlist #172) -- Remove low_cpu_mem_usage=True from from_pretrained
+#   What: Removed low_cpu_mem_usage=True from AutoModelForCausalLM.from_pretrained()
+#   Why:  Triggers accelerate init_empty_weights() meta-device path; strict=False
+#         load_state_dict leaves some params on meta; after ~7k steps a hidden-state
+#         traversal hits an unmaterialized param. Model is 1GB, VPS has 15GB -- no
+#         memory justification for the flag.
+#   How:  Deleted the flag. Full CPU load, same result, no meta-device risk.
 # [2026-03-29] Claude Code (Opus 4.6) — Unified encoder, no v1/v2 split
 #   What: Single GraphEncoder reads whatever data is available. No branching.
 #   Why:  Same encoder for frozen and living brain. Reads topology deltas,
@@ -183,7 +190,6 @@ class ProtoUniBrainSocket(ElmerSocket):
             base = AutoModelForCausalLM.from_pretrained(
                 self._config['base_model'],
                 dtype=_torch.float32,
-                low_cpu_mem_usage=True,
             )
             body = base.model
             body.embed_tokens = None
