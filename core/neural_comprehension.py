@@ -9,6 +9,12 @@ Brain is wired externally by BrainSwitcher after ProtoUniBrain loads — this
 socket never self-loads any model. Falls back to heuristics until brain arrives.
 
 # ---- Changelog ----
+# [2026-04-19] Claude Code (Sonnet 4.6) — Fix _neural_process brain call + signal unpacking
+#   What: Removed GraphFeatures conversion; call self._brain(snapshot=snapshot) directly.
+#         Unpack signals tensor via signal_names; fix key names (coherence not coherence_score).
+#   Why:  graph_encoder.ElmerBrain expects snapshot=, not a GraphFeatures positional arg.
+#         output['signals'] is a tensor, not a dict — .get() fails on both counts.
+#   How:  Skip _snapshot_to_features(); unpack (1,9) tensor into named dict for SubstrateSignal.
 # [2026-04-18] Claude Code (Sonnet 4.6) — Wire to ProtoUniBrain via BrainSwitcher
 #   What: Removed self-loading ElmerBrain. load() is now a no-op that starts in
 #         heuristic fallback. set_brain(brain) / revoke_brain() called by
@@ -141,27 +147,35 @@ class NeuralComprehensionSocket(ElmerSocket):
     def _neural_process(self, snapshot: GraphSnapshot, context: dict, t0: float) -> SocketOutput:
         """Process using the transformer brain."""
         try:
-            from graph_io import GraphFeatures
-
-            # Convert GraphSnapshot → GraphFeatures
-            features = self._snapshot_to_features(snapshot)
-
-            # Run transformer inference
+            # graph_encoder.ElmerBrain takes snapshot= directly — no GraphFeatures conversion.
+            # Passing a GraphFeatures struct as positional arg hit topology_delta=, causing
+            # _read_global() to call .get() on a dataclass (fixed 2026-04-19).
             with torch.no_grad():
-                output = self._brain(features)
+                output = self._brain(snapshot=snapshot)
 
             elapsed = time.time() - t0
             self._total_latency += elapsed
 
-            signals = output['signals']
-            top_action = output['top_action']
+            # output['signals'] is a tensor (batch, n_fields); unpack via signal_names.
+            signals_tensor = output['signals']       # (1, 9)
+            signal_names = output.get('signal_names', [])
+            signals = {name: signals_tensor[0, i].item()
+                       for i, name in enumerate(signal_names)}
+
+            # top_action from actions tensor
+            actions_tensor = output['actions']       # (1, n_actions)
+            action_names = output.get('action_names', [])
+            top_idx = int(actions_tensor[0].argmax().item())
+            top_action = action_names[top_idx] if top_idx < len(action_names) else 'observe'
+            action_probs = {name: actions_tensor[0, i].item()
+                            for i, name in enumerate(action_names)}
 
             signal = SubstrateSignal.create(
                 signal_type="observation",
                 description=f"Neural comprehension: {top_action}",
-                coherence_score=signals.get('coherence_score', 0.5),
-                health_score=signals.get('health_score', 0.5),
-                anomaly_level=signals.get('anomaly_level', 0.0),
+                coherence_score=signals.get('coherence', 0.5),
+                health_score=signals.get('health', 0.5),
+                anomaly_level=signals.get('anomaly', 0.0),
                 novelty=signals.get('novelty', 0.5),
                 confidence=signals.get('confidence', 0.5),
                 severity=signals.get('severity', 0.0),
@@ -173,7 +187,7 @@ class NeuralComprehensionSocket(ElmerSocket):
                     "socket": self.socket_id,
                     "mode": "neural",
                     "top_action": top_action,
-                    "action_probs": output['actions'],
+                    "action_probs": action_probs,
                     "inference_ms": elapsed * 1000,
                     "node_count": len(snapshot.nodes),
                     "edge_count": len(snapshot.edges),
