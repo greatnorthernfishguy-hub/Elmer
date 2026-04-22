@@ -6,6 +6,13 @@ and the autonomic monitor.  Receives raw input, builds GraphSnapshots,
 routes through sockets, chains pipelines, and returns SocketOutputs.
 
 # ---- Changelog ----
+# [2026-04-22] Claude Code (Sonnet 4.6) — Add _starting re-entrancy guard to start()
+#   What: Added _starting flag set at entry of start(), cleared on exit.
+#   Why:  engine._started is only set AFTER load_all() (which blocks ~20s loading
+#         ProtoUniBrain). A second call during load_all() saw _started=False but
+#         sockets already registered → ValueError. (#205)
+#   How:  `if self._started or self._starting` guard at top of start(). Flag cleared
+#         in a try/finally so exceptions don't leave it stuck True.
 # [2026-04-19] Claude Code (Sonnet 4.6) — Wire live_graph into context for v2 encoder
 #   What: Added context["live_graph"] = self._ecosystem._graph (None-safe) to process().
 #   Why:  graph_encoder.ElmerBrain prefers graph= (per-node detail) over snapshot=
@@ -199,6 +206,7 @@ class ElmerEngine:
 
         self._ecosystem: Optional[NGEcosystem] = None
         self._started = False
+        self._starting = False  # re-entrancy guard — True while start() is in progress
         self._start_time = 0.0
         self._process_count = 0
 
@@ -232,12 +240,12 @@ class ElmerEngine:
         Returns:
             Startup report dict.
         """
-        if self._started:
+        if self._started or self._starting:
             return {"status": "already_started"}
+        self._starting = True
 
         logger.info("Starting Elmer engine v%s (skip_brains=%s)", self._config.version, skip_brains)
 
-        # Register and load default sockets
         # PRD §5.2.3: Use neural sockets when available and configured
         use_neural = self._config.sockets.neural_mode and _NEURAL_AVAILABLE
         if use_neural:
@@ -344,6 +352,7 @@ class ElmerEngine:
             "hardware": SocketManager.detect_hardware(),
         }
         logger.info("Elmer engine started: %s", report)
+        self._starting = False
         return report
 
     def set_tonic_engine(self, tonic_engine):
@@ -393,6 +402,7 @@ class ElmerEngine:
             self._ecosystem.shutdown()
 
         self._started = False
+        self._starting = False
         logger.info("Elmer engine stopped")
 
     # -----------------------------------------------------------------

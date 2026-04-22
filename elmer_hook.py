@@ -29,6 +29,10 @@ stats() / health():
 #         and runs engine.process_text() with synthetic health signal when
 #         engine is started. on_conversation_started/ended swap intervals
 #         (30s resting / 10s conversation). Does not touch _module_on_message.
+# [2026-04-22] Claude Code (Sonnet 4.6) — Guard _deferred_start against post-stop() runs
+#   What: _deferred_start() checks _shutdown_event before calling self.start().
+#   Why:  Thread spawned in __init__ fires after stop() in tests → see engine.py #205 fix.
+#   How:  `if self._shutdown_event.is_set(): return` at thread entry.
 # [2026-03-29] Claude Code (Opus 4.6) — Fan-out context: engine without brains
 # What: Refined NEUROGRAPH_FANOUT_CONTEXT guard. Instead of skipping __init__
 #   entirely (leaving _started=False forever), call engine.start(skip_brains=True).
@@ -230,6 +234,8 @@ class ElmerHook(OpenClawAdapter):
         else:
             # Standalone: start engine with brains in background thread
             def _deferred_start():
+                if self._shutdown_event.is_set():
+                    return  # stop() was called before thread ran — bail cleanly
                 try:
                     with open("/tmp/elmer_eager.log", "a") as _f:
                         _f.write(f"[{__import__('datetime').datetime.now()}] Eager start beginning (background)...\n")
