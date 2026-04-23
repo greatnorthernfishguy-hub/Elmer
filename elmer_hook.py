@@ -517,6 +517,26 @@ class ElmerHook(OpenClawAdapter):
     # Health  (PRD §14)
     # -----------------------------------------------------------------
 
+    def _module_stats(self) -> Dict[str, Any]:
+        """Elmer-specific stats — sockets, ProtoUniBrain, pipelines, autonomic."""
+        if not self._started:
+            return {"started": False}
+        h = self._engine.health()
+        sockets = h.get("sockets") or {}
+        brain = h.get("brain") or {}
+        pipelines = h.get("pipelines") or {}
+        return {
+            "started": True,
+            "autonomic_state": h.get("autonomic_state", "PARASYMPATHETIC"),
+            "process_count": h.get("process_count", 0),
+            "proto_unibrain": sockets.get("elmer:proto_unibrain", {}).get("status", "offline"),
+            "sockets": {sid: s.get("status", "offline") for sid, s in sockets.items()},
+            "brain": brain,
+            "pipelines": {k: v.get("processed", 0) for k, v in pipelines.items() if isinstance(v, dict)},
+        }
+
+    # -----------------------------------------------------------------
+
     def health(self) -> Dict[str, Any]:
         """Comprehensive health report with §14 threshold status."""
         engine_health = self._engine.health() if self._started else {"status": "offline"}
