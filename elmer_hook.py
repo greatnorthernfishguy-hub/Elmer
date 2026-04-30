@@ -19,6 +19,13 @@ stats() / health():
     and autonomic state.
 
 # ---- Changelog ----
+# [2026-04-29] Claude Code (Sonnet 4.6) — Wire CC Tonic to BrainSwitcher for body sharing (#159)
+#   What: Added CC Tonic registration in _delayed_brain_load() after Syl's wiring.
+#   Why:  neurograph_rpc.py bootstrap attempt searched _memory._modules (empty at boot)
+#         — always a no-op. _delayed_brain_load() fires 60s post-startup after
+#         BrainSwitcher loads brains — correct timing for hot-swap offer.
+#   How:  sys.modules.get('cc_ng_host') finds CC's TonicEngine; self._engine.set_tonic_engine()
+#         registers with BrainSwitcher. Independent try-except from Syl's wiring.
 # [2026-03-28] Claude Code (Opus 4.6) — #109 Pulse loop: Elmer alive between conversations
 #   What: Added _pulse_loop() daemon thread following the Tonic pattern.
 #   Why:  #109 — organs must run continuously, not only on fan-out messages.
@@ -220,6 +227,24 @@ class ElmerHook(OpenClawAdapter):
                             logger.warning("Tonic wiring: _memory is None")
                     except Exception as exc:
                         logger.warning("Tonic wiring failed: %s", exc)
+
+                    # Register CC's Tonic for body sharing (#159) — independent of Syl's.
+                    # cc_ng_host is already imported in neurograph_rpc.py; sys.modules lookup
+                    # is safe in namespace-isolated fan-out context.
+                    try:
+                        import sys as _sys
+                        _cc_mod = _sys.modules.get('cc_ng_host')
+                        _cc_st = getattr(_cc_mod, '_STATE', None)
+                        _cc_ng = getattr(_cc_st, 'cc_ng', None) if _cc_st else None
+                        _cc_tt = getattr(_cc_ng, '_tonic_thread', None) if _cc_ng else None
+                        _cc_eng = getattr(_cc_tt, '_latent_engine', None) if _cc_tt else None
+                        if _cc_eng is not None:
+                            self._engine.set_tonic_engine(_cc_eng)
+                            logger.info("CC Tonic registered with BrainSwitcher — body sharing live (#159)")
+                        else:
+                            logger.debug("CC Tonic not running — single-engine mode")
+                    except Exception as _ccte:
+                        logger.debug("CC Tonic BrainSwitcher registration failed (non-fatal): %s", _ccte)
 
                     with open("/tmp/elmer_eager.log", "a") as _f:
                         _f.write(f"[{__import__('datetime').datetime.now()}] Delayed brain load SUCCEEDED\n")
