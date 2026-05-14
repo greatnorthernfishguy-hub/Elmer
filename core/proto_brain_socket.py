@@ -9,6 +9,15 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-05-13] CC — DecoderAdapter: identity-init bridge between evolved body and frozen decoder
+#   What: Added DecoderAdapter (hidden_size×hidden_size linear, no bias, identity init).
+#         Sits between transformer body output and frozen SignalDecoder. Governed by Lenia.
+#   Why:  After ~38k Lenia steps the body hidden states drifted out-of-distribution for
+#         the frozen decoder → all SubstrateSignal outputs saturated (anomaly=1 constant).
+#         Adapter absorbs drift; decoder contract stays stable. Option B from design discussion.
+#   How:  DecoderAdapter assigned to self._brain.decoder_adapter — PyTorch auto-registers
+#         it in state_dict, so it persists in proto_weights.pt at zero extra save/load code.
+#         Passed as decoder= to LeniaEngine so Rust governs its evolution.
 # [2026-04-19] CC (punchlist #172) -- Remove low_cpu_mem_usage=True from from_pretrained
 #   What: Removed low_cpu_mem_usage=True from AutoModelForCausalLM.from_pretrained()
 #   Why:  Triggers accelerate init_empty_weights() meta-device path; strict=False
@@ -54,6 +63,7 @@ from core.base_socket import (
 from core.substrate_signal import SubstrateSignal
 
 logger = logging.getLogger("elmer.proto_brain")
+
 
 _torch = None
 _brain_module = None
@@ -173,7 +183,22 @@ class ProtoUniBrainSocket(ElmerSocket):
         """Load the model with UNFROZEN body and attach Lenia dynamics."""
         try:
             _lazy_imports()
+            import torch.nn as _nn
             from transformers import AutoModelForCausalLM
+
+            class DecoderAdapter(_nn.Module):
+                """Identity-init bridge between evolved body and frozen decoder.
+                Absorbs hidden-state distribution drift as Lenia reshapes the body.
+                Lenia-governed (registered as decoder= in LeniaEngine). Starts as
+                pure passthrough; diverges only as the body drifts.
+                """
+                def __init__(self, hidden_size: int):
+                    super().__init__()
+                    self.proj = _nn.Linear(hidden_size, hidden_size, bias=False)
+                    _nn.init.eye_(self.proj.weight)
+
+                def forward(self, x):
+                    return self.proj(x)
 
             # Load checkpoint config
             checkpoint = _torch.load(
@@ -220,9 +245,19 @@ class ProtoUniBrainSocket(ElmerSocket):
                 for param in self._brain.encoder.parameters():
                     param.requires_grad = True
 
-            # Attach Lenia dynamics engine — operates on EVERYTHING:
-            # body (transformer) + encoder (the eyes).
-            # Decoder is decoupled — it's a River bucket, not a model layer.
+            # Decoder adapter — absorbs body↔decoder distribution drift.
+            # Identity init: pure passthrough at start, Lenia governs evolution.
+            # Assigning as nn.Module attribute auto-registers it in state_dict.
+            self._brain.decoder_adapter = DecoderAdapter(self._config['hidden_size'])
+            for param in self._brain.decoder_adapter.parameters():
+                param.requires_grad = True
+            logger.info(
+                "ProtoUniBrain: DecoderAdapter created (%d×%d, identity init)",
+                self._config['hidden_size'], self._config['hidden_size'],
+            )
+
+            # Attach Lenia dynamics engine — body + encoder (eyes) + decoder adapter.
+            # The frozen SignalDecoder is NOT included — it's the stable output vocabulary.
             self._lenia = _lenia_module.LeniaEngine(
                 self._brain.transformer_body,
                 _lenia_module.LeniaConfig(
@@ -235,6 +270,7 @@ class ProtoUniBrainSocket(ElmerSocket):
                     activation_coupling=0.5,
                 ),
                 encoder=getattr(self._brain, 'encoder', None),
+                decoder=self._brain.decoder_adapter,
             )
             self._lenia.register_hooks()
 
