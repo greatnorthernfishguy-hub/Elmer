@@ -9,6 +9,11 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-05-22] CC — Fix _read_river_delta() tract path: was reading elmer.tract (wrong inbox)
+#   What: Changed tract_path from neurograph/elmer.tract to neurograph/proto_unibrain.tract.
+#   Why:  Proto was consuming Elmer's NeuroGraph inbox, not its own. ~8G accumulated unread.
+#         Tail-read (32KB) means no catch-up flood on fix.
+#   How:  One-line path correction.
 # [2026-05-13] CC — DecoderAdapter: identity-init bridge between evolved body and frozen decoder
 #   What: Added DecoderAdapter (hidden_size×hidden_size linear, no bias, identity init).
 #         Sits between transformer body output and frozen SignalDecoder. Governed by Lenia.
@@ -691,7 +696,7 @@ class ProtoUniBrainSocket(ElmerSocket):
         try:
             import ng_tract
             tract_path = os.path.expanduser(
-                "~/.et_modules/tracts/neurograph/elmer.tract"
+                "~/.et_modules/tracts/neurograph/proto_unibrain.tract"
             )
             if not os.path.exists(tract_path):
                 return None
