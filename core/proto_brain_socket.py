@@ -9,6 +9,18 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-05-23] CC — Morphogenesis-inspired DecoderAdapter CRISPR pressure/kick
+#   What: Added _check_adapter_pressure(), _apply_crispr_kick(), _log_kick_event().
+#         Tracks consecutive steps where adapter weight deviation from identity < 0.005.
+#         After 200 stuck steps, injects structured noise (off-diagonal full-scale,
+#         diagonal 10x smaller) to break identity equilibrium. Kick scale escalates
+#         with kick count. Events logged to competence_delta.jsonl.
+#         adapter_deviation / adapter_stuck_steps / adapter_kick_count added to metadata.
+#   Why:  DecoderAdapter frozen at identity (step 9357+): anomaly=0.999998 constant.
+#         Lenia has no gradient to work with when the adapter is pure passthrough.
+#         Kick gives Lenia surface area — breaks symmetry so dynamics can learn.
+#   How:  _check_adapter_pressure() called in process() outside body_lock, after
+#         Lenia step. Adapter weights are separate from transformer_body (Tonic-safe).
 # [2026-05-22] CC — Fix _read_river_delta() tract path: was reading elmer.tract (wrong inbox)
 #   What: Changed tract_path from neurograph/elmer.tract to neurograph/proto_unibrain.tract.
 #   Why:  Proto was consuming Elmer's NeuroGraph inbox, not its own. ~8G accumulated unread.
@@ -81,6 +93,11 @@ _PROTO_WEIGHTS_PATH = os.path.expanduser("~/.elmer/proto_weights.pt")
 _PROTO_LENIA_STATE_PATH = os.path.expanduser("~/.elmer/proto_lenia_state.pt")
 _DELTA_LOG_PATH = os.path.expanduser("~/.elmer/competence_delta.jsonl")
 _WEIGHT_STATS_LOG_PATH = os.path.expanduser("~/.elmer/weight_stats.jsonl")
+
+# Adapter pressure monitoring (Morphogenesis-inspired CRISPR kick)
+_ADAPTER_STUCK_EPSILON = 0.005     # identity deviation below this = stuck
+_ADAPTER_STUCK_THRESHOLD = 200     # consecutive stuck steps before kick
+_ADAPTER_KICK_SCALE = 0.01         # base noise magnitude on kick
 
 
 def _lazy_imports():
@@ -163,6 +180,9 @@ class ProtoUniBrainSocket(ElmerSocket):
         self._splat_step_count = 0
         self._ecosystem = ecosystem
         self._body_lock = None
+        self._adapter_stuck_steps = 0
+        self._adapter_kick_count = 0
+        self._adapter_last_deviation = 0.0
 
     def set_body_lock(self, lock) -> None:
         """Set the shared body access lock (from BrainSwitcher)."""
@@ -433,6 +453,10 @@ class ProtoUniBrainSocket(ElmerSocket):
                 except Exception as e:
                     logger.warning("SplatAdapter step failed (non-fatal): %s", e)
 
+            # Adapter pressure check — outside lock, reads/writes adapter weights only.
+            # Measures identity deviation; applies CRISPR kick when stuck too long.
+            self._check_adapter_pressure(raw_hidden)
+
             # Deposit raw hidden state to River — outside lock, no body access
             self._deposit_to_river(raw_hidden)
 
@@ -520,6 +544,9 @@ class ProtoUniBrainSocket(ElmerSocket):
                         "lenia_step": self._lenia_steps,
                         "lenia_delta_norm": lenia_metrics['total_delta_norm'],
                         "lenia_time_ms": lenia_metrics.get('time_ms', 0),
+                        "adapter_deviation": round(self._adapter_last_deviation, 8),
+                        "adapter_stuck_steps": self._adapter_stuck_steps,
+                        "adapter_kick_count": self._adapter_kick_count,
                         "model": "proto_unibrain",
                         "raw": raw_stats,
                     },
@@ -576,6 +603,86 @@ class ProtoUniBrainSocket(ElmerSocket):
             )
         except Exception as exc:
             logger.debug("River deposit failed: %s", exc)
+
+    # -----------------------------------------------------------------
+    # Adapter pressure monitoring (Morphogenesis-inspired)
+    # -----------------------------------------------------------------
+
+    def _check_adapter_pressure(self, raw_hidden) -> None:
+        """Detect and break DecoderAdapter stuck-at-identity.
+
+        Measures L2 deviation of adapter weight from identity matrix.
+        If deviation stays near zero for _ADAPTER_STUCK_THRESHOLD steps,
+        the adapter has never moved — Lenia has no gradient to work with.
+        Apply a CRISPR-style kick: structured noise that breaks the
+        identity symmetry in off-diagonal directions, giving Lenia
+        surface area to start learning.
+        """
+        adapter = getattr(self._brain, 'decoder_adapter', None)
+        if adapter is None:
+            return
+        try:
+            w = adapter.proj.weight            # (hidden_size, hidden_size)
+            dim = w.shape[0]
+            eye = _torch.eye(dim, device=w.device, dtype=w.dtype)
+            deviation = float((w - eye).norm().item() / dim)
+            self._adapter_last_deviation = deviation
+
+            if deviation < _ADAPTER_STUCK_EPSILON:
+                self._adapter_stuck_steps += 1
+            else:
+                self._adapter_stuck_steps = max(0, self._adapter_stuck_steps - 5)
+
+            if self._adapter_stuck_steps >= _ADAPTER_STUCK_THRESHOLD:
+                self._apply_crispr_kick(w, dim)
+                deviation_before = deviation
+                self._adapter_stuck_steps = 0
+                self._adapter_kick_count += 1
+                self._log_kick_event(deviation_before)
+        except Exception as exc:
+            logger.debug("Adapter pressure check failed: %s", exc)
+
+    def _apply_crispr_kick(self, weight: 'torch.Tensor', dim: int) -> None:
+        """Inject structured noise to break identity equilibrium.
+
+        Off-diagonal gets full-scale noise (breaks the identity).
+        Diagonal gets 10× smaller noise (preserves rough passthrough).
+        Kick scale escalates with kick count — each kick is bolder than
+        the last if the adapter keeps snapping back to identity.
+        """
+        pressure_factor = 1.0 + self._adapter_kick_count * 0.5
+        kick_scale = _ADAPTER_KICK_SCALE * pressure_factor
+        with _torch.no_grad():
+            noise = _torch.randn_like(weight) * kick_scale
+            eye_mask = _torch.eye(dim, device=weight.device, dtype=_torch.bool)
+            noise[eye_mask] *= 0.1
+            weight.add_(noise)
+        logger.info(
+            "ProtoUniBrain: CRISPR kick #%d applied (scale=%.4f, "
+            "stuck_steps_reset, deviation_before=%.6f)",
+            self._adapter_kick_count + 1,
+            kick_scale,
+            self._adapter_last_deviation,
+        )
+
+    def _log_kick_event(self, deviation_before: float) -> None:
+        """Append CRISPR kick event to competence_delta.jsonl."""
+        os.makedirs(os.path.dirname(_DELTA_LOG_PATH), exist_ok=True)
+        try:
+            from datetime import datetime
+            import json
+            entry = {
+                "timestamp": datetime.now().isoformat(),
+                "event": "crispr_kick",
+                "lenia_step": self._lenia_steps,
+                "kick_number": self._adapter_kick_count + 1,
+                "deviation_before": round(deviation_before, 8),
+                "pressure_factor": round(1.0 + self._adapter_kick_count * 0.5, 2),
+            }
+            with open(_DELTA_LOG_PATH, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception as exc:
+            logger.debug("CRISPR kick log failed: %s", exc)
 
     def set_ecosystem_ref(self, ecosystem):
         """Set reference to Elmer's own ecosystem. Called by engine after init."""
