@@ -9,6 +9,11 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-05-23] CC — Fix log_weight_stats() silent failure: parameters() → named_parameters() (#247)
+#   What: Line 774: self._brain.parameters() → self._brain.named_parameters().
+#   Why:  parameters() returns bare tensors; unpacking into (name, param) always raised
+#         ValueError, caught silently. weight_stats.jsonl has never been written.
+#   How:  One-word fix.
 # [2026-05-23] CC — Morphogenesis-inspired DecoderAdapter CRISPR pressure/kick
 #   What: Added _check_adapter_pressure(), _apply_crispr_kick(), _log_kick_event().
 #         Tracks consecutive steps where adapter weight deviation from identity < 0.005.
@@ -771,7 +776,7 @@ class ProtoUniBrainSocket(ElmerSocket):
 
             total_near_zero = 0
             total_params = 0
-            for name, param in self._brain.parameters():
+            for name, param in self._brain.named_parameters():
                 if param.requires_grad and param.dim() >= 2:
                     near_zero = (param.abs() < 0.01).sum().item()
                     total = param.numel()
