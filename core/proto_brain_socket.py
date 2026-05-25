@@ -9,6 +9,20 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-05-25] CC — Fix #249: restore River data flow to proto encoder
+#   What: (1) _read_river_delta: fixed magic scan b"BT"→b"TB", changed filter from
+#         entry_type==2 (topology) to entry_type==ENTRY_OUTCOME (1, 768-dim embeddings).
+#         Added cursor-based reading (proto_unibrain.cursor, same JSON format as bridge).
+#         Returns List[np.ndarray] instead of PyTopologyEntry.
+#         (2) process(): encoder call changed topology_delta= → outcome_embeddings=.
+#         (3) logger.debug→logger.error on River read failure so silent bugs surface.
+#   Why:  River has never delivered real data to the encoder. Tract carries OUTCOME
+#         entries (NeuroGraph learning events, 768-dim embeddings) — encoder was
+#         looking for TOPOLOGY entries that don't exist in this tract. BTF magic is
+#         0x54,0x42 ("TB") not 0x42,0x54 ("BT") — magic scan never matched.
+#         GraphEncoder (in graph_encoder.py) also updated: outcome_proj linear added,
+#         outcome_embeddings path prepends projected embeddings to position sequence.
+#   How:  See graph_encoder.py #249 changelog for encoder side.
 # [2026-05-25] CC — Fresh start: fix adapter init + CRISPR detection (post-collapse analysis)
 #   What: (1) DecoderAdapter init: eye_() → normal_(std=0.02). Prevents Lenia mass-conservation
 #             collapse (identity diagonal=1.0 is 50x body weight scale → Lenia shrank it to 0).
@@ -416,7 +430,7 @@ class ProtoUniBrainSocket(ElmerSocket):
                 # Forward pass — get raw hidden state, NOT decoder output
                 with _torch.no_grad():
                     inputs_embeds = self._brain.encoder(
-                        topology_delta=latest_delta,
+                        outcome_embeddings=latest_delta,
                         autonomic_state=autonomic,
                     )
                     body_output = self._brain.transformer_body(
@@ -810,15 +824,22 @@ class ProtoUniBrainSocket(ElmerSocket):
             logger.debug("ProtoUniBrain: weight stats log failed: %s", exc)
 
     def _read_river_delta(self):
-        """Read the latest topology delta from the River (BTF tract).
+        """Read new outcome embeddings from the River (BTF ENTRY_OUTCOME entries).
 
-        Reads the tail of the BTF tract file deposited by NeuroGraph.
-        Returns a PyTopologyEntry for the encoder's BTF fast path,
-        or None if no tract data available.
+        Uses a cursor to read only entries deposited since last call.
+        Returns List[np.ndarray] of 768-dim embeddings, or None if nothing new.
 
         The River IS the input. No bridges, no _peer_events.
+
+        # ---- Changelog ----
+        # [2026-05-25] CC — Fix #249: was filtering entry_type==2 (topology) but tract
+        #   holds entry_type==1 (outcome, 768-dim embedding). Magic scan used b"BT" but
+        #   BTF format is b"TB" (0x54, 0x42). Added cursor so we read only new entries
+        #   each call instead of re-scanning the whole growing tract file.
+        # -------------------
         """
         try:
+            import json as _json
             import ng_tract
             tract_path = os.path.expanduser(
                 "~/.et_modules/tracts/neurograph/proto_unibrain.tract"
@@ -826,39 +847,60 @@ class ProtoUniBrainSocket(ElmerSocket):
             if not os.path.exists(tract_path):
                 return None
 
-            # Read the last chunk of the tract — recent entries only.
-            # The tract grows continuously; we only need the latest delta.
-            chunk_size = 32768  # 32KB — enough for several topology entries
             file_size = os.path.getsize(tract_path)
             if file_size == 0:
                 return None
 
-            offset = max(0, file_size - chunk_size)
+            # Cursor tracks bytes already consumed — same JSON format as bridge cursors
+            cursor_path = os.path.expanduser(
+                "~/.et_modules/tracts/neurograph/proto_unibrain.cursor"
+            )
+            offset = 0
+            if os.path.exists(cursor_path):
+                try:
+                    with open(cursor_path) as _cf:
+                        _cd = _json.load(_cf)
+                    offset = int(_cd.get("offset", 0))
+                except Exception:
+                    offset = 0
+
+            if offset >= file_size:
+                return None  # nothing new
+
+            # Read bytes deposited since last cursor position
             with open(tract_path, "rb") as f:
-                if offset > 0:
-                    f.seek(offset)
+                f.seek(offset)
                 data = f.read()
 
-            # If we seeked into the middle, find the first valid entry
-            # by scanning for the BTF magic bytes (0x42, 0x54)
+            if not data:
+                return None
+
+            # If reading mid-file, scan forward to first valid BTF entry (magic: TB = 0x54, 0x42)
             if offset > 0:
-                magic_pos = data.find(b"BT")
-                if magic_pos >= 0:
+                magic_pos = data.find(b"TB")
+                if magic_pos > 0:
                     data = data[magic_pos:]
-                else:
-                    # No valid entry in tail — read more
-                    with open(tract_path, "rb") as f:
-                        data = f.read()
 
             reader = ng_tract.TractReader(data)
-            last_topo = None
+            embeddings = []
             for entry in reader:
-                if entry.entry_type == 2:  # topology
-                    last_topo = entry
-            return last_topo
+                if hasattr(entry, "entry_type") and entry.entry_type == ng_tract.ENTRY_OUTCOME:
+                    if hasattr(entry, "embedding_as_numpy"):
+                        emb = entry.embedding_as_numpy()
+                        if emb is not None and len(emb) > 0:
+                            embeddings.append(emb)
+
+            # Advance cursor to current file end
+            try:
+                with open(cursor_path, "w") as _cf:
+                    _json.dump({"offset": file_size, "ts": time.time(), "entries": len(embeddings)}, _cf)
+            except Exception:
+                pass
+
+            return embeddings if embeddings else None
 
         except Exception as exc:
-            logger.debug("River read failed: %s", exc)
+            logger.error("River read failed: %s", exc)
             return None
 
 
