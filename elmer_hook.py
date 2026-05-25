@@ -19,6 +19,15 @@ stats() / health():
     and autonomic state.
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — NEW-5: Replace dead manual drain with _drain_river()
+#   What: Replaced manual _eco._peer_bridge._drain_all() block in _pulse_cycle() with
+#         self._drain_river(). Removed dead _eco.record_outcome() call that also silently
+#         failed because _eco is None (SKIP_ECOSYSTEM=True).
+#   Why:  self._eco is None (SKIP_ECOSYSTEM=True), so the bridge was always None and
+#         the entire drain block was dead code — tracts were not being drained. The
+#         _eco.record_outcome() call also silently failed for the same reason.
+#         _drain_river() uses self._tract_bridge correctly (set up by OpenClawAdapter).
+#   How:  Drop manual block entirely; call self._drain_river() which hits _tract_bridge.
 # [2026-04-29] Claude Code (Sonnet 4.6) — Wire CC Tonic to BrainSwitcher for body sharing (#159)
 #   What: Added CC Tonic registration in _delayed_brain_load() after Syl's wiring.
 #   Why:  neurograph_rpc.py bootstrap attempt searched _memory._modules (empty at boot)
@@ -308,32 +317,8 @@ class ElmerHook(OpenClawAdapter):
 
     def _pulse_cycle(self):
         """One pulse cycle — drain River tracts, read autonomic, run topology pass."""
-        # 1. Drain tracts from peer bridge (topology deltas from the River)
-        #    _drain_all() reads JSONL tract files (where topology deltas land)
-        #    and populates _peer_events. bridge.drain() is the mmap path (empty
-        #    when no mmap tracts are set up). Without _drain_all(), JSONL tracts
-        #    accumulate undrained forever.
-        drained = 0
-        try:
-            bridge = getattr(self._eco, '_peer_bridge', None) if hasattr(self, '_eco') else None
-            if bridge and hasattr(bridge, '_drain_all'):
-                before = len(getattr(bridge, '_peer_events', []))
-                bridge._drain_all()
-                peer_events = getattr(bridge, '_peer_events', [])
-                new_events = peer_events[before:]
-                drained = len(new_events)
-                for event in new_events:
-                    if not isinstance(event, dict): continue
-                    raw_emb = event.get('embedding')
-                    if raw_emb is None: continue
-                    try:
-                        emb = np.asarray(raw_emb, dtype=np.float32)
-                        if self._eco:
-                            self._eco.record_outcome(emb, target_id="elmer:river_event", success=True, metadata={'source': 'river_pulse'})
-                    except Exception as exc:
-                        logger.debug("Pulse deposit error: %s", exc)
-        except Exception as exc:
-            logger.debug("Pulse drain error: %s", exc)
+        # 1. Drain River tracts via base class (_tract_bridge, BTF)
+        drained = self._drain_river()
 
         # 2. Read autonomic state for context
         try:
