@@ -9,6 +9,17 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-05-25] CC — Fix #251: handle ENTRY_TOPOLOGY entries (type=2)
+#   What: _read_river_delta now reads BOTH ENTRY_OUTCOME and ENTRY_TOPOLOGY entries.
+#         Topology entries decoded via msgpack, keys normalized to encoder dict format
+#         (fired_node_ids→fired_nodes, predictions_confirmed→predictions.confirmed, etc.).
+#         Returns dict {'topology': dict|None, 'outcomes': List[np.ndarray]|None}.
+#         Call site updated to unpack and pass topology_delta= + outcome_embeddings=.
+#   Why:  After the River drain fix (#249), NeuroGraph started depositing TOPOLOGY
+#         entries (type=2) not OUTCOME (type=1). Our #249 fix read the right bytes but
+#         filtered for the wrong type — still got idle_token. Topology entries carry
+#         richer substrate data (node IDs, synapse events, prediction accuracy).
+#   How:  Normalize at consumption boundary per LAW 7. Encoder dict path unchanged.
 # [2026-05-25] CC — Fix #249: restore River data flow to proto encoder
 #   What: (1) _read_river_delta: fixed magic scan b"BT"→b"TB", changed filter from
 #         entry_type==2 (topology) to entry_type==ENTRY_OUTCOME (1, 768-dim embeddings).
@@ -429,8 +440,11 @@ class ProtoUniBrainSocket(ElmerSocket):
             with _body_ctx:
                 # Forward pass — get raw hidden state, NOT decoder output
                 with _torch.no_grad():
+                    _topo = latest_delta.get("topology") if isinstance(latest_delta, dict) else None
+                    _outcomes = latest_delta.get("outcomes") if isinstance(latest_delta, dict) else None
                     inputs_embeds = self._brain.encoder(
-                        outcome_embeddings=latest_delta,
+                        topology_delta=_topo,
+                        outcome_embeddings=_outcomes,
                         autonomic_state=autonomic,
                     )
                     body_output = self._brain.transformer_body(
@@ -824,22 +838,29 @@ class ProtoUniBrainSocket(ElmerSocket):
             logger.debug("ProtoUniBrain: weight stats log failed: %s", exc)
 
     def _read_river_delta(self):
-        """Read new outcome embeddings from the River (BTF ENTRY_OUTCOME entries).
+        """Read new substrate entries from the River (BTF tract).
+
+        Handles both entry types deposited by NeuroGraph:
+        - ENTRY_OUTCOME (type=1): 768-dim embedding → outcome_embeddings
+        - ENTRY_TOPOLOGY (type=2): msgpack compact topology delta → topology_delta dict
 
         Uses a cursor to read only entries deposited since last call.
-        Returns List[np.ndarray] of 768-dim embeddings, or None if nothing new.
-
-        The River IS the input. No bridges, no _peer_events.
+        Returns dict with keys 'topology' (dict|None) and 'outcomes' (List[np.ndarray]|None).
 
         # ---- Changelog ----
-        # [2026-05-25] CC — Fix #249: was filtering entry_type==2 (topology) but tract
-        #   holds entry_type==1 (outcome, 768-dim embedding). Magic scan used b"BT" but
-        #   BTF format is b"TB" (0x54, 0x42). Added cursor so we read only new entries
-        #   each call instead of re-scanning the whole growing tract file.
+        # [2026-05-25] CC — Fix #251: handle ENTRY_TOPOLOGY entries (type=2) which NeuroGraph
+        #   now deposits after the River drain fix (#249 other CC). Topology entries carry
+        #   msgpack-encoded compact delta (fired_node_ids, synapses_pruned/sprouted,
+        #   predictions_confirmed/surprised). Normalized to encoder's dict format at this
+        #   boundary (LAW 7: extraction happens at consumption). Returns dict with both
+        #   'topology' and 'outcomes' keys so caller can pass each to encoder correctly.
+        # [2026-05-25] CC — Fix #249: magic bytes b"BT"→b"TB", ENTRY_OUTCOME filter,
+        #   cursor-based reading, logger.debug→logger.error.
         # -------------------
         """
         try:
             import json as _json
+            import msgpack as _msgpack
             import ng_tract
             tract_path = os.path.expanduser(
                 "~/.et_modules/tracts/neurograph/proto_unibrain.tract"
@@ -883,21 +904,58 @@ class ProtoUniBrainSocket(ElmerSocket):
 
             reader = ng_tract.TractReader(data)
             embeddings = []
+            last_topo_dict = None
+            topo_count = 0
+            outcome_count = 0
+
             for entry in reader:
-                if hasattr(entry, "entry_type") and entry.entry_type == ng_tract.ENTRY_OUTCOME:
+                if not hasattr(entry, "entry_type"):
+                    continue
+                if entry.entry_type == ng_tract.ENTRY_OUTCOME:
                     if hasattr(entry, "embedding_as_numpy"):
                         emb = entry.embedding_as_numpy()
                         if emb is not None and len(emb) > 0:
                             embeddings.append(emb)
+                            outcome_count += 1
+                elif entry.entry_type == ng_tract.ENTRY_TOPOLOGY:
+                    # Decode msgpack and normalize to encoder's dict format.
+                    # Topology entries carry compact delta: fired_node_ids, synapses_pruned/sprouted,
+                    # predictions_confirmed/surprised. Normalize at this boundary so the encoder's
+                    # existing dict path (_read_from_delta, _read_global) works unchanged.
+                    try:
+                        raw = entry.raw()
+                        raw_dict = _msgpack.unpackb(raw, raw=False)
+                        last_topo_dict = {
+                            "fired_nodes": [{"node_id": nid} for nid in raw_dict.get("fired_node_ids", [])],
+                            "fired_hyperedges": [{"he_id": hid} for hid in raw_dict.get("fired_hyperedge_ids", [])],
+                            "predictions": {
+                                "confirmed": raw_dict.get("predictions_confirmed", 0),
+                                "surprised": raw_dict.get("predictions_surprised", 0),
+                            },
+                            "structural": {
+                                "synapses_pruned": raw_dict.get("synapses_pruned", 0),
+                                "synapses_sprouted": raw_dict.get("synapses_sprouted", 0),
+                            },
+                            "timestep": raw_dict.get("timestep", 0),
+                            "salience": [],
+                        }
+                        topo_count += 1
+                    except Exception:
+                        pass
 
             # Advance cursor to current file end
+            total = outcome_count + topo_count
             try:
                 with open(cursor_path, "w") as _cf:
-                    _json.dump({"offset": file_size, "ts": time.time(), "entries": len(embeddings)}, _cf)
+                    _json.dump({"offset": file_size, "ts": time.time(), "entries": total}, _cf)
             except Exception:
                 pass
 
-            return embeddings if embeddings else None
+            result = {
+                "topology": last_topo_dict,
+                "outcomes": embeddings if embeddings else None,
+            }
+            return result if (last_topo_dict is not None or embeddings) else None
 
         except Exception as exc:
             logger.error("River read failed: %s", exc)
