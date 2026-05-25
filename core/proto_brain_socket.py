@@ -9,6 +9,22 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-05-25] CC — Fresh start: fix adapter init + CRISPR detection (post-collapse analysis)
+#   What: (1) DecoderAdapter init: eye_() → normal_(std=0.02). Prevents Lenia mass-conservation
+#             collapse (identity diagonal=1.0 is 50x body weight scale → Lenia shrank it to 0).
+#         (2) _check_adapter_pressure: measures decoder signal saturation via probe (adapter →
+#             decoder → sat_frac) instead of identity deviation. Identity deviation was a proxy
+#             that fired on the wrong condition — Lenia had moved the adapter off-identity into
+#             an equally degenerate zero attractor without triggering the stuck counter.
+#         (3) _apply_crispr_kick: full re-init to N(0,0.02) instead of additive noise. Landing
+#             at body scale lets Lenia treat the adapter as a peer, not an outlier.
+#         (4) Removed stale constants _ADAPTER_STUCK_EPSILON + _ADAPTER_KICK_SCALE.
+#         (5) proto_weights.pt + proto_lenia_state.pt deleted for clean restart.
+#   Why:  Post-mortem: adapter diagonal collapsed 1.0→0.0 over 8580 Lenia steps. Off-diagonal
+#         stayed at exactly 0.0 (std=0.00000000). Near-zero adapter output → decoder bias-
+#         dominated → constant signals. CRISPR never fired (deviation stayed > 0.005 once
+#         Lenia started moving). Punchlist #240 concern about co-evolution compounding drift
+#         was exactly correct.
 # [2026-05-23] CC — Fix log_weight_stats() silent failure: parameters() → named_parameters() (#247)
 #   What: Line 774: self._brain.parameters() → self._brain.named_parameters().
 #   Why:  parameters() returns bare tensors; unpacking into (name, param) always raised
@@ -100,9 +116,8 @@ _DELTA_LOG_PATH = os.path.expanduser("~/.elmer/competence_delta.jsonl")
 _WEIGHT_STATS_LOG_PATH = os.path.expanduser("~/.elmer/weight_stats.jsonl")
 
 # Adapter pressure monitoring (Morphogenesis-inspired CRISPR kick)
-_ADAPTER_STUCK_EPSILON = 0.005     # identity deviation below this = stuck
-_ADAPTER_STUCK_THRESHOLD = 200     # consecutive stuck steps before kick
-_ADAPTER_KICK_SCALE = 0.01         # base noise magnitude on kick
+_ADAPTER_STUCK_THRESHOLD = 200     # consecutive saturated steps before kick
+_ADAPTER_SAT_THRESHOLD = 0.75      # fraction of decoder signals pegged at 0/1 = stuck
 
 
 def _lazy_imports():
@@ -187,7 +202,7 @@ class ProtoUniBrainSocket(ElmerSocket):
         self._body_lock = None
         self._adapter_stuck_steps = 0
         self._adapter_kick_count = 0
-        self._adapter_last_deviation = 0.0
+        self._adapter_sat_frac = 0.0
 
     def set_body_lock(self, lock) -> None:
         """Set the shared body access lock (from BrainSwitcher)."""
@@ -225,7 +240,7 @@ class ProtoUniBrainSocket(ElmerSocket):
                 def __init__(self, hidden_size: int):
                     super().__init__()
                     self.proj = _nn.Linear(hidden_size, hidden_size, bias=False)
-                    _nn.init.eye_(self.proj.weight)
+                    _nn.init.normal_(self.proj.weight, std=0.02)
 
                 def forward(self, x):
                     return self.proj(x)
@@ -549,7 +564,7 @@ class ProtoUniBrainSocket(ElmerSocket):
                         "lenia_step": self._lenia_steps,
                         "lenia_delta_norm": lenia_metrics['total_delta_norm'],
                         "lenia_time_ms": lenia_metrics.get('time_ms', 0),
-                        "adapter_deviation": round(self._adapter_last_deviation, 8),
+                        "adapter_sat_frac": round(self._adapter_sat_frac, 4),
                         "adapter_stuck_steps": self._adapter_stuck_steps,
                         "adapter_kick_count": self._adapter_kick_count,
                         "model": "proto_unibrain",
@@ -614,63 +629,62 @@ class ProtoUniBrainSocket(ElmerSocket):
     # -----------------------------------------------------------------
 
     def _check_adapter_pressure(self, raw_hidden) -> None:
-        """Detect and break DecoderAdapter stuck-at-identity.
+        """Detect and break DecoderAdapter output saturation.
 
-        Measures L2 deviation of adapter weight from identity matrix.
-        If deviation stays near zero for _ADAPTER_STUCK_THRESHOLD steps,
-        the adapter has never moved — Lenia has no gradient to work with.
-        Apply a CRISPR-style kick: structured noise that breaks the
-        identity symmetry in off-diagonal directions, giving Lenia
-        surface area to start learning.
+        Runs a quick probe: raw_hidden → adapter → decoder → check what
+        fraction of the 9 signal outputs are pegged at 0 or 1 (Sigmoid
+        saturation). If >= _ADAPTER_SAT_THRESHOLD of signals are saturated
+        for _ADAPTER_STUCK_THRESHOLD consecutive steps, apply a CRISPR kick:
+        re-initialize the adapter to N(0, 0.02) so Lenia starts from a
+        realistic scale rather than an identity or zero attractor.
+
+        Measures the real problem (decoder sees constant bias-dominated input)
+        rather than a proxy (identity deviation), which was the v1 failure mode.
         """
         adapter = getattr(self._brain, 'decoder_adapter', None)
         if adapter is None:
             return
         try:
-            w = adapter.proj.weight            # (hidden_size, hidden_size)
-            dim = w.shape[0]
-            eye = _torch.eye(dim, device=w.device, dtype=w.dtype)
-            deviation = float((w - eye).norm().item() / dim)
-            self._adapter_last_deviation = deviation
+            with _torch.no_grad():
+                adapted = adapter(raw_hidden)
+                probe = self._brain.decoder(adapted)
+            signals = probe['signals']  # (1, 9), Sigmoid → [0, 1]
+            sat_frac = float(((signals > 0.98) | (signals < 0.02)).float().mean())
+            self._adapter_sat_frac = sat_frac
 
-            if deviation < _ADAPTER_STUCK_EPSILON:
+            if sat_frac >= _ADAPTER_SAT_THRESHOLD:
                 self._adapter_stuck_steps += 1
             else:
                 self._adapter_stuck_steps = max(0, self._adapter_stuck_steps - 5)
 
             if self._adapter_stuck_steps >= _ADAPTER_STUCK_THRESHOLD:
-                self._apply_crispr_kick(w, dim)
-                deviation_before = deviation
+                w = adapter.proj.weight
+                sat_before = sat_frac
+                self._apply_crispr_kick(w, w.shape[0])
                 self._adapter_stuck_steps = 0
                 self._adapter_kick_count += 1
-                self._log_kick_event(deviation_before)
+                self._log_kick_event(sat_before)
         except Exception as exc:
             logger.debug("Adapter pressure check failed: %s", exc)
 
     def _apply_crispr_kick(self, weight: 'torch.Tensor', dim: int) -> None:
-        """Inject structured noise to break identity equilibrium.
+        """Re-initialize adapter to N(0, 0.02) — same scale as transformer body.
 
-        Off-diagonal gets full-scale noise (breaks the identity).
-        Diagonal gets 10× smaller noise (preserves rough passthrough).
-        Kick scale escalates with kick count — each kick is bolder than
-        the last if the adapter keeps snapping back to identity.
+        Full re-init rather than additive noise. This avoids Lenia re-collapsing
+        a nudged-but-still-degenerate weight — we want to land in the same
+        distribution the body occupies so Lenia's mass conservation law treats
+        the adapter as a peer, not an outlier to shrink.
         """
-        pressure_factor = 1.0 + self._adapter_kick_count * 0.5
-        kick_scale = _ADAPTER_KICK_SCALE * pressure_factor
         with _torch.no_grad():
-            noise = _torch.randn_like(weight) * kick_scale
-            eye_mask = _torch.eye(dim, device=weight.device, dtype=_torch.bool)
-            noise[eye_mask] *= 0.1
-            weight.add_(noise)
+            _torch.nn.init.normal_(weight, std=0.02)
         logger.info(
-            "ProtoUniBrain: CRISPR kick #%d applied (scale=%.4f, "
-            "stuck_steps_reset, deviation_before=%.6f)",
+            "ProtoUniBrain: CRISPR kick #%d — adapter re-init to N(0,0.02) "
+            "(sat_frac_before=%.4f, stuck_steps_reset)",
             self._adapter_kick_count + 1,
-            kick_scale,
-            self._adapter_last_deviation,
+            self._adapter_sat_frac,
         )
 
-    def _log_kick_event(self, deviation_before: float) -> None:
+    def _log_kick_event(self, sat_before: float) -> None:
         """Append CRISPR kick event to competence_delta.jsonl."""
         os.makedirs(os.path.dirname(_DELTA_LOG_PATH), exist_ok=True)
         try:
@@ -681,8 +695,7 @@ class ProtoUniBrainSocket(ElmerSocket):
                 "event": "crispr_kick",
                 "lenia_step": self._lenia_steps,
                 "kick_number": self._adapter_kick_count + 1,
-                "deviation_before": round(deviation_before, 8),
-                "pressure_factor": round(1.0 + self._adapter_kick_count * 0.5, 2),
+                "sat_frac_before": round(sat_before, 4),
             }
             with open(_DELTA_LOG_PATH, "a") as f:
                 f.write(json.dumps(entry) + "\n")
