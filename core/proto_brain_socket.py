@@ -297,7 +297,7 @@ class ProtoUniBrainSocket(ElmerSocket):
             for param in self._brain.decoder_adapter.parameters():
                 param.requires_grad = True
             logger.info(
-                "ProtoUniBrain: DecoderAdapter created (%d×%d, identity init)",
+                "ProtoUniBrain: DecoderAdapter created (%d×%d, N(0,0.02) init)",
                 self._config['hidden_size'], self._config['hidden_size'],
             )
 
