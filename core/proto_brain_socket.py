@@ -9,6 +9,19 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-05-25] CC — Lenia Phase 1: activation-coupled dynamics, body collapse reset (#252)
+#   What: (1) LeniaConfig: added noise_scale=0.2.
+#         (2) save/restore: _initial_mean_abs persisted alongside _initial_norms.
+#         (3) _reset_body_to_pretrained(): reloads body from cached Qwen2.5-0.5B
+#             safetensors, clears Lenia baselines (_initial_norms + _initial_mean_abs).
+#         (4) _check_and_reset_body(): detects collapse (std≈0 on >50% of body
+#             weight matrices) at startup, triggers reset if found.
+#   Why:  Ring kernel + mass conservation created permanent constant-field fixed point.
+#         168/168 body matrices had std=0. h_mean≈7, h_norm>>420 (bias-dominated).
+#         Lenia burned 0.82 delta-norm/step, all reversed by conservation. Same failure
+#         mode as TID free-model domination — attractor wins by physics, not merit.
+#   How:  Collapse auto-detected on load; pretrained weights injected; Lenia re-baselines
+#         from healthy pretrained stats on first post-reset step.
 # [2026-05-25] CC — Fix #251: handle ENTRY_TOPOLOGY entries (type=2)
 #   What: _read_river_delta now reads BOTH ENTRY_OUTCOME and ENTRY_TOPOLOGY entries.
 #         Topology entries decoded via msgpack, keys normalized to encoder dict format
@@ -338,6 +351,7 @@ class ProtoUniBrainSocket(ElmerSocket):
                     growth_scale=0.005,
                     max_weight_delta=0.05,
                     activation_coupling=0.5,
+                    noise_scale=0.2,
                 ),
                 encoder=getattr(self._brain, 'encoder', None),
                 decoder=self._brain.decoder_adapter,
@@ -386,6 +400,9 @@ class ProtoUniBrainSocket(ElmerSocket):
 
             # Restore previously evolved weights (if any)
             self._restore_evolved_weights()
+
+            # Detect and repair body collapse from prior Lenia failure (Phase 0 fixed points)
+            self._check_and_reset_body()
 
             return True
 
@@ -738,6 +755,60 @@ class ProtoUniBrainSocket(ElmerSocket):
     # Weight persistence — proto brain survives fan-out cycles
     # -----------------------------------------------------------------
 
+    def _reset_body_to_pretrained(self) -> None:
+        """Reset all transformer body weights to the pretrained Qwen2.5-0.5B checkpoint.
+
+        Called when body collapse is detected (all/most weight matrices std≈0).
+        Lenia baselines are cleared so Phase 1 measures from the healthy pretrained values.
+        """
+        from safetensors.torch import load_file
+        pretrained_path = os.path.expanduser(
+            "~/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/"
+            "snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987/model.safetensors"
+        )
+        if not os.path.exists(pretrained_path):
+            logger.error("ProtoUniBrain: pretrained checkpoint not found at %s — cannot reset", pretrained_path)
+            return
+
+        pretrained = load_file(pretrained_path)
+        restored = 0
+        for name, param in self._brain.transformer_body.named_parameters():
+            hf_key = f"model.{name}"
+            if hf_key in pretrained:
+                param.data.copy_(pretrained[hf_key].to(param.dtype))
+                restored += 1
+        for name, buf in self._brain.transformer_body.named_buffers():
+            hf_key = f"model.{name}"
+            if hf_key in pretrained:
+                buf.data.copy_(pretrained[hf_key].to(buf.dtype))
+
+        # Clear Lenia baselines so they're re-measured from healthy pretrained values
+        self._lenia._initial_norms.clear()
+        if hasattr(self._lenia, '_initial_mean_abs'):
+            self._lenia._initial_mean_abs.clear()
+
+        logger.info(
+            "ProtoUniBrain: body reset to pretrained (%d params restored). Lenia baselines cleared.",
+            restored,
+        )
+
+    def _check_and_reset_body(self) -> None:
+        """Detect body weight collapse and reset to pretrained if >50% of matrices have std≈0."""
+        collapsed = sum(
+            1 for _, p in self._brain.transformer_body.named_parameters()
+            if p.dim() >= 2 and p.requires_grad and p.float().std().item() < 1e-6
+        )
+        total = sum(
+            1 for _, p in self._brain.transformer_body.named_parameters()
+            if p.dim() >= 2 and p.requires_grad
+        )
+        if total > 0 and collapsed / total > 0.5:
+            logger.warning(
+                "ProtoUniBrain: body collapse detected (%d/%d matrices std≈0). Resetting to pretrained.",
+                collapsed, total,
+            )
+            self._reset_body_to_pretrained()
+
     def _restore_evolved_weights(self) -> bool:
         """Restore previously evolved weights + Lenia state from disk.
 
@@ -759,12 +830,13 @@ class ProtoUniBrainSocket(ElmerSocket):
                 saved.get('timestamp', 'unknown'),
             )
 
-            # Restore Lenia engine state (initial norms for mass conservation)
+            # Restore Lenia engine state (baselines for Phase 1 activation-coupled dynamics)
             if os.path.exists(_PROTO_LENIA_STATE_PATH) and self._lenia:
                 lenia_state = _torch.load(_PROTO_LENIA_STATE_PATH, map_location="cpu", weights_only=False)
                 self._lenia._initial_norms = lenia_state.get('initial_norms', {})
+                self._lenia._initial_mean_abs = lenia_state.get('initial_mean_abs', {})
                 self._lenia.state.step_count = lenia_state.get('step_count', 0)
-                logger.info("ProtoUniBrain: restored Lenia state (norms for %d params)",
+                logger.info("ProtoUniBrain: restored Lenia state (baselines for %d params)",
                             len(self._lenia._initial_norms))
 
             return True
@@ -788,10 +860,11 @@ class ProtoUniBrainSocket(ElmerSocket):
                 'process_count': self._process_count,
             }, _PROTO_WEIGHTS_PATH)
 
-            # Save Lenia state separately (initial norms critical for mass conservation)
+            # Save Lenia state (baselines for Phase 1 activation-coupled dynamics)
             if self._lenia:
                 _torch.save({
                     'initial_norms': self._lenia._initial_norms,
+                    'initial_mean_abs': self._lenia._initial_mean_abs,
                     'step_count': self._lenia.state.step_count,
                     'weight_deltas': {k: v for k, v in self._lenia.state.weight_deltas.items()},
                 }, _PROTO_LENIA_STATE_PATH)
