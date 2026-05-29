@@ -13,3 +13,6 @@ venv/
 *.bak
 models/
 logs/
+
+# understand-anything plugin working cache (scan/intermediate/tmp artifacts — regenerable)
+.understand-anything/
