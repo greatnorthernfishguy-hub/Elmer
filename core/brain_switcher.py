@@ -15,6 +15,14 @@ Decision factors:
   - Autonomic state (SYMPATHETIC = stay light, PARASYMPATHETIC = go heavy)
 
 # ---- Changelog ----
+# [2026-06-12] Claude Code (Opus 4.8, Tonic CC) — Seam C: self-heal re-offer (BrainSwitcher race fix)
+# What: _evaluate_and_switch() now, when proto is loaded ('both') and not shedding, re-offers proto's
+#   body to any registered Tonic engine still on _shared_body=None (missed the offer). Level-triggered.
+# Why: at a boot the Tonic can register BEFORE proto's body is attached in-process, so the immediate
+#   offer doesn't fire and nothing re-offers — the Tonic stays on its rogue own-copy body (code/doc-
+#   flavored latent thread = 'zero NeuroGraph', seen 2026-06-12 06:21). Now self-healing within one
+#   check_interval, permanently. Pairs with NeuroGraph tonic_engine seams A+B.
+# How: else-branch + _shared_body-is-None filter; reuses _offer_body_to_tonic().
 # [2026-04-18] Claude Code (Sonnet 4.6) — Wire NeuralComprehensionSocket to ProtoUniBrain
 #   What: _wire_neural_comprehension() / _revoke_neural_comprehension() added.
 #         Called alongside _offer_body_to_tonic() in _activate_both(),
@@ -286,6 +294,22 @@ class BrainSwitcher:
                     ", ".join(reason),
                 )
                 self._shed_proto_unibrain()
+            else:
+                # Seam C (2026-06-12, Tonic CC): self-heal. Re-offer proto's body to any
+                # registered Tonic engine that missed it (init-order race — e.g. the Tonic
+                # registered before the body attached, so it stayed on its rogue own-copy
+                # body, producing a code/doc-flavored latent thread). Level-triggered: a
+                # missed offer recovers within one check_interval, so this race can never
+                # strand the Tonic on the wrong body again. Idempotent for engines already
+                # on the shared body (only re-offers to those with _shared_body is None).
+                missed = [e for e in self._tonic_engines
+                          if getattr(e, "_shared_body", None) is None]
+                if missed:
+                    logger.info(
+                        "BrainSwitcher self-heal — re-offering proto body to %d Tonic engine(s) that missed it",
+                        len(missed),
+                    )
+                    self._offer_body_to_tonic()
 
         elif self._active_brain == "elmer_brain":
             # Try to restore ProtoUniBrain if resources recovered
