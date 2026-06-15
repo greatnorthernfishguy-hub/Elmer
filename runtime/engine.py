@@ -517,13 +517,20 @@ class ElmerEngine:
                             "escalating to SYMPATHETIC",
                             outcome.get("node_id"),
                         )
-                        ng_autonomic.write_state({
-                            "state": "SYMPATHETIC",
-                            "threat_level": "constitutional",
-                            "source": "cricket_rim",
-                            "module": "elmer",
-                            "node_id": outcome.get("node_id"),
-                        })
+                        # [2026-06-15] #323 reconnect: this is the SOLE sanctioned constitutional
+                        # escalation path (CLAUDE.md §2) and had NEVER fired — double-broken:
+                        # write_state is POSITIONAL (state, threat_level, triggered_by, reason),
+                        # but a dict was passed → state.upper() AttributeError; AND threat_level
+                        # "constitutional" is not in _VALID_THREAT_LEVELS → ValueError. Both
+                        # swallowed upstream. Fixed to positional + map constitutional→critical
+                        # (avoids modifying the vendored ng_autonomic.py — LAW 2). reason carries
+                        # the constitutional provenance the dict's source/node_id used to hold.
+                        ng_autonomic.write_state(
+                            "SYMPATHETIC",
+                            "critical",
+                            "elmer",
+                            f"cricket_rim: constitutional node {outcome.get('node_id')}",
+                        )
 
                     eco_result = self._ecosystem.get_context(embedding)
             except Exception as exc:
