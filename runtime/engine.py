@@ -6,6 +6,18 @@ and the autonomic monitor.  Receives raw input, builds GraphSnapshots,
 routes through sockets, chains pipelines, and returns SocketOutputs.
 
 # ---- Changelog ----
+# [2026-06-22] Claude Code (Opus 4.8) — #328 Step 3 (B): Cricket-rim → depositor (not autonomic writer)
+#   What: The constitutional-violation path now DEPOSITS a raw "violation:constitutional:<node_id>"
+#         event to the Commons instead of calling ng_autonomic.write_state("SYMPATHETIC"). Immunis
+#         (the sole arousal authority) buckets it and decides arousal.
+#   Why: #328 single-authority — Cricket-rim writing the autonomic file made it a SECOND writer
+#         (with Immunis + TrollGuard), the multi-writer clobber #328 removes. Cricket returns to
+#         being the non-emitting extraction rim: it REPORTS an attempted violation, it does not set
+#         ecosystem state. Supersedes the #323 file write_state.
+#   How: commons.deposit(embedding, "violation:constitutional:<node_id>", metadata={...}). Single raw
+#         deposit (LAW 7 — Immunis classifies at its own bucket; NOT dual-pass). Fail-soft. Requires
+#         Immunis Step-3 (A) listener (committed) to act on it. NOTE: Elmer's autonomic READ (engine/
+#         hook still read_state the file) migrates to Commons read_arousal in the Step-2 reader sweep.
 # [2026-04-22] Claude Code (Sonnet 4.6) — Add _starting re-entrancy guard to start()
 #   What: Added _starting flag set at entry of start(), cleared on exit.
 #   Why:  engine._started is only set AFTER load_all() (which blocks ~20s loading
@@ -513,24 +525,30 @@ class ElmerEngine:
                     # Elmer's read-only autonomic rule (CLAUDE.md §2).
                     if outcome.get("constitutional"):
                         logger.warning(
-                            "Cricket rim activated — constitutional node %s, "
-                            "escalating to SYMPATHETIC",
+                            "Cricket rim activated — constitutional node %s — "
+                            "depositing violation to the Commons (Immunis decides arousal)",
                             outcome.get("node_id"),
                         )
-                        # [2026-06-15] #323 reconnect: this is the SOLE sanctioned constitutional
-                        # escalation path (CLAUDE.md §2) and had NEVER fired — double-broken:
-                        # write_state is POSITIONAL (state, threat_level, triggered_by, reason),
-                        # but a dict was passed → state.upper() AttributeError; AND threat_level
-                        # "constitutional" is not in _VALID_THREAT_LEVELS → ValueError. Both
-                        # swallowed upstream. Fixed to positional + map constitutional→critical
-                        # (avoids modifying the vendored ng_autonomic.py — LAW 2). reason carries
-                        # the constitutional provenance the dict's source/node_id used to hold.
-                        ng_autonomic.write_state(
-                            "SYMPATHETIC",
-                            "critical",
-                            "elmer",
-                            f"cricket_rim: constitutional node {outcome.get('node_id')}",
-                        )
+                        # [2026-06-22] #328 Step 3 (B): Cricket-rim is a DEPOSITOR, not an arousal
+                        # writer. Deposit the raw constitutional-violation event to the Commons;
+                        # Immunis (the SOLE arousal authority) buckets it and decides SYMPATHETIC.
+                        # Cricket returns to non-emitting — it REPORTS an attempted violation (raw
+                        # experience, LAW 7 — NOT dual-pass; Immunis classifies at its own bucket),
+                        # it does not set ecosystem state. Supersedes the #323 file write_state (which
+                        # was a second autonomic writer — the multi-writer clobber #328 removes).
+                        try:
+                            from commons import get_commons
+                            _c = get_commons()
+                            if _c is not None:
+                                _c.deposit(
+                                    embedding,
+                                    f"violation:constitutional:{outcome.get('node_id')}",
+                                    metadata={"kind": "violation", "violation": "constitutional",
+                                              "node_id": outcome.get("node_id"),
+                                              "source": "cricket_rim", "ts": time.time()},
+                                )
+                        except Exception as exc:  # noqa: BLE001 — deposit failure never breaks the engine
+                            logger.debug("Cricket-rim Commons deposit failed: %s", exc)
 
                     eco_result = self._ecosystem.get_context(embedding)
             except Exception as exc:
