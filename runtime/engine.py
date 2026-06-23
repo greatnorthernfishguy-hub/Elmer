@@ -6,6 +6,12 @@ and the autonomic monitor.  Receives raw input, builds GraphSnapshots,
 routes through sockets, chains pipelines, and returns SocketOutputs.
 
 # ---- Changelog ----
+# [2026-06-23] Claude Code (Opus 4.8) — #328 Step 2: ElmerEngine reads arousal from the Commons
+#   What: New module-level _commons_arousal() (full-dict vagus bucket); the 3 ng_autonomic.read_state()
+#         reads (process_text, _drain_loop closure, health) now use it. Module-level so it works inside
+#         the _drain_loop closure. Preserves threat_level (autonomic_intensity), not just state.
+#   Why: #328 reader-sweep completion — the audit found engine.py reads the file (the hook sweep
+#         missed them). Elmer reads, never writes (Cricket-rim WRITE already became a depositor, Step 3 B).
 # [2026-06-22] Claude Code (Opus 4.8) — #328 Step 3 (B): Cricket-rim → depositor (not autonomic writer)
 #   What: The constitutional-violation path now DEPOSITS a raw "violation:constitutional:<node_id>"
 #         event to the Commons instead of calling ng_autonomic.write_state("SYMPATHETIC"). Immunis
@@ -187,6 +193,22 @@ from runtime.graph_encoder import GraphEncoder
 from runtime.signal_decoder import SignalDecoder
 
 logger = logging.getLogger("elmer.engine")
+
+
+def _commons_arousal(default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """#328 Step 2: latest arousal metadata from the Commons (the vagus bucket), fail-soft.
+    Elmer reads, never writes — Immunis (sole authority) deposits autonomic:arousal. Returns the
+    full dict ({state, threat_level, ...}) so callers can use intensity, not just state. Replaces
+    ng_autonomic.read_state() file reads. Module-level so it works in nested closures (e.g. _drain_loop).
+    """
+    if default is None:
+        default = {"state": "PARASYMPATHETIC", "threat_level": "none"}
+    try:
+        from commons import get_commons
+        _c = get_commons()
+        return _c.arousal() if _c is not None else default
+    except Exception:
+        return default
 
 
 class ElmerEngine:
@@ -451,8 +473,8 @@ class ElmerEngine:
         if self._brain_switcher:
             self._brain_switcher.notify_input()
 
-        # Read autonomic state  (PRD §7)
-        autonomic = ng_autonomic.read_state()
+        # Read autonomic state  (PRD §7) — #328 Step 2: arousal from the Commons, not the file.
+        autonomic = _commons_arousal()
         context = {
             "autonomic_state": autonomic.get("state", "PARASYMPATHETIC"),
             "autonomic_intensity": autonomic.get("threat_level", "none"),
@@ -722,7 +744,7 @@ class ElmerEngine:
                     # The River always has fresh topology from the Tonic.
                     try:
                         from core.base_socket import GraphSnapshot
-                        autonomic = ng_autonomic.read_state()
+                        autonomic = _commons_arousal()  # #328 Step 2: arousal from the Commons
                         empty_snapshot = GraphSnapshot(nodes=[], edges=[], metadata={})
                         empty_context = {
                             "autonomic_state": autonomic.get("state", "PARASYMPATHETIC"),
@@ -993,7 +1015,7 @@ class ElmerEngine:
             "sockets": socket_health,
             "ecosystem": eco_stats,
             "health_signal": health_signal.to_dict(),
-            "autonomic_state": ng_autonomic.read_state().get("state", "PARASYMPATHETIC"),
+            "autonomic_state": _commons_arousal().get("state", "PARASYMPATHETIC"),
             "pipelines": {
                 "sensory": self._sensory.stats(),
                 "inference": self._inference.stats(),
