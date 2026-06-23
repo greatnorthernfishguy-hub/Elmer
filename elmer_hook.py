@@ -19,6 +19,12 @@ stats() / health():
     and autonomic state.
 
 # ---- Changelog ----
+# [2026-06-22] Claude Code (Opus 4.8) — #328 Step 2: Elmer reads arousal from the Commons
+#   What: New _arousal() helper buckets get_commons().read_arousal(); the 4 ng_autonomic.read_state()
+#         reads (_pulse_cycle, _process_message, _enrich_context, health) now call self._arousal().
+#   Why: #328 reader sweep — autonomic is deposit (Immunis) + bucket (everyone). Elmer reads, never
+#         writes (its Cricket-rim WRITE already became a Commons depositor in Step 3 B). Fail-soft.
+#   How: read_arousal direct-lookup (vagus never missed). ng_autonomic import now unused (harmless).
 # [2026-05-25] Claude Code (Sonnet 4.6) — NEW-5: Replace dead manual drain with _drain_river()
 #   What: Replaced manual _eco._peer_bridge._drain_all() block in _pulse_cycle() with
 #         self._drain_river(). Removed dead _eco.record_outcome() call that also silently
@@ -315,6 +321,18 @@ class ElmerHook(OpenClawAdapter):
             )
             self._shutdown_event.wait(timeout=interval)
 
+    def _arousal(self) -> str:
+        """#328 Step 2: current arousal from the Commons (the vagus bucket). Elmer reads, never writes.
+        Immunis (sole authority) deposits autonomic:arousal; Elmer buckets it via read_arousal,
+        replacing ng_autonomic.read_state() file reads. Fail-soft → PARASYMPATHETIC.
+        """
+        try:
+            from commons import get_commons
+            _c = get_commons()
+            return _c.read_arousal() if _c is not None else "PARASYMPATHETIC"
+        except Exception:
+            return "PARASYMPATHETIC"
+
     def _pulse_cycle(self):
         """One pulse cycle — drain River tracts, read autonomic, run topology pass."""
         # 1. Drain River tracts via base class (_tract_bridge, BTF)
@@ -322,7 +340,7 @@ class ElmerHook(OpenClawAdapter):
 
         # 2. Read autonomic state for context
         try:
-            autonomic_state = ng_autonomic.read_state().get("state", "PARASYMPATHETIC")
+            autonomic_state = self._arousal()
         except Exception:
             autonomic_state = "PARASYMPATHETIC"
 
@@ -470,7 +488,7 @@ class ElmerHook(OpenClawAdapter):
         This path is only hit if OpenClaw invokes the skill directly.
         """
         try:
-            autonomic_state = ng_autonomic.read_state().get("state", "PARASYMPATHETIC")
+            autonomic_state = self._arousal()
             sensory_signal = self._sensory.process(text)
             inference_signal = self._inference.process(sensory_signal)
             self._memory.store(inference_signal)
@@ -512,7 +530,7 @@ class ElmerHook(OpenClawAdapter):
             context["identity"] = identity_signal.metadata.get("identity", {})
 
             # Autonomic awareness  (PRD §7)
-            autonomic_state = ng_autonomic.read_state().get("state", "PARASYMPATHETIC")
+            autonomic_state = self._arousal()
             context["autonomic_state"] = autonomic_state
 
         except Exception as exc:
@@ -564,7 +582,7 @@ class ElmerHook(OpenClawAdapter):
                 "memory": self._memory.stats(),
                 "identity": self._identity.stats(),
             },
-            "autonomic_state": ng_autonomic.read_state().get("state", "PARASYMPATHETIC"),
+            "autonomic_state": self._arousal(),
             "coherence_status": health_signal.coherence_status,
             "ecosystem": self.stats(),
         }
