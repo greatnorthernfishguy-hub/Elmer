@@ -19,6 +19,23 @@ stats() / health():
     and autonomic state.
 
 # ---- Changelog ----
+# [2026-06-26] Claude Code (Sonnet 4.6) — Fix LAW 7 pulse violation + restore dead _on_river_events (LAW 3)
+#   What: (1) _pulse_cycle() called process_text(f"pulse:autonomic={autonomic_state},drained={drained}")
+#         every 30s — a synthetic pre-classified label deposited into the substrate, violating LAW 7.
+#         Fixed: pulse now just calls _drain_river(); ProtoUniBrain Lenia is sustained by the
+#         engine's brain drain idle branch (engine.py _drain_loop, empty_snapshot every 60s) which
+#         was already running autonomously and never needed pulse injection (engine.py lines 741-758).
+#         (2) _on_river_events() override added: _drain_river() (base class) calls it for each event
+#         batch but ElmerHook never overrode it, so ALL BTF events silently hit the base no-op since
+#         NEW-5 (2026-05-25), permanently dead-ending #154's raw River absorption path. Override now
+#         deposits raw BTF event embeddings directly via eco.record_outcome() — no sensory pipeline,
+#         no label wrapping (LAW 7). Events without embeddings are skipped.
+#   Why:  "pulse:autonomic=PARASYMPATHETIC,drained=3" is a pre-classification label, not raw
+#         experience (ARCHITECTURE.md §7, LAW 7 — substrate receives raw unclassified experience).
+#         Dead _on_river_events = LAW 3 (restore not rebuild — #154's intent existed, override missing).
+#   How:  _pulse_cycle → single self._drain_river() call. _on_river_events() loops events, handles
+#         typed BTF (embedding_as_numpy()) and dicts; records via eco.record_outcome(). Substrate
+#         _ecosystem accessed via getattr to fail-soft if engine not yet started.
 # [2026-06-22] Claude Code (Opus 4.8) — #328 Step 2: Elmer reads arousal from the Commons
 #   What: New _arousal() helper buckets get_commons().read_arousal(); the 4 ng_autonomic.read_state()
 #         reads (_pulse_cycle, _process_message, _enrich_context, health) now call self._arousal().
@@ -334,24 +351,51 @@ class ElmerHook(OpenClawAdapter):
             return "PARASYMPATHETIC"
 
     def _pulse_cycle(self):
-        """One pulse cycle — drain River tracts, read autonomic, run topology pass."""
-        # 1. Drain River tracts via base class (_tract_bridge, BTF)
-        drained = self._drain_river()
+        """One pulse cycle — drain River tracts, absorb raw events into substrate.
 
-        # 2. Read autonomic state for context
-        try:
-            autonomic_state = self._arousal()
-        except Exception:
-            autonomic_state = "PARASYMPATHETIC"
+        ProtoUniBrain Lenia runs autonomously on the engine's brain drain idle
+        branch (engine.py _drain_loop empty_snapshot path, 60s interval) — no
+        pulse injection needed. The classified label removed here was LAW 7 violation.
+        """
+        # Drain tracts. Calls _on_river_events() for LAW 7-compliant absorption.
+        self._drain_river()
 
-        # 3. Lightweight topology pass if engine is started
-        if self._started:
+    def _on_river_events(self, events: list) -> None:
+        """Absorb raw River topology into Elmer's substrate. Restores #154.
+
+        Law 7: BTF event embeddings are raw experience from peer module deposits.
+        Record directly — no sensory pipeline classification before deposit.
+        Events without embeddings are skipped (hash fallback is not a substitute
+        for a missing raw signal — would deposit noise, not experience).
+        """
+        if not self._started or not events:
+            return
+        eco = getattr(self._engine, '_ecosystem', None)
+        if eco is None:
+            return
+        for event in events:
             try:
-                self._engine.process_text(
-                    f"pulse:autonomic={autonomic_state},drained={drained}"
+                # Handle typed BTF objects and legacy dicts
+                if hasattr(event, 'embedding_as_numpy'):
+                    emb = event.embedding_as_numpy()
+                elif isinstance(event, dict):
+                    raw = event.get('embedding')
+                    emb = np.asarray(raw, dtype=np.float32) if raw else None
+                else:
+                    emb = None
+                if emb is None or not len(emb):
+                    continue
+                target_id = (event.get('target_id', 'river:event') if isinstance(event, dict)
+                             else getattr(event, 'target_id', 'river:event'))
+                success = (event.get('success', True) if isinstance(event, dict)
+                           else bool(getattr(event, 'success', True)))
+                eco.record_outcome(
+                    embedding=np.asarray(emb, dtype=np.float32),
+                    target_id=target_id,
+                    success=success,
                 )
             except Exception as exc:
-                logger.debug("Pulse topology pass error: %s", exc)
+                logger.debug("River event absorption error: %s", exc)
 
     def on_conversation_started(self):
         """Mode swap: shorter pulse interval during active conversation."""
