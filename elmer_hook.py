@@ -380,7 +380,7 @@ class ElmerHook(OpenClawAdapter):
                     emb = event.embedding_as_numpy()
                 elif isinstance(event, dict):
                     raw = event.get('embedding')
-                    emb = np.asarray(raw, dtype=np.float32) if raw else None
+                    emb = np.asarray(raw, dtype=np.float32) if raw is not None else None
                 else:
                     emb = None
                 if emb is None or not len(emb):
