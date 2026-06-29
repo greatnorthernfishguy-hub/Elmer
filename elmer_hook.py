@@ -19,6 +19,24 @@ stats() / health():
     and autonomic state.
 
 # ---- Changelog ----
+# [2026-06-29] Claude Code (Sonnet 4.6) — #329 Commons bucket migration (BUCKET-ONLY, deposit deferred)
+#   What: _bucket_commons_substrate() in _pulse_cycle() buckets metrics:neurograph:* deposits from
+#         the Commons → _commons_substrate_novelty EWMA. Exposed in health() as
+#         'commons_substrate_novelty'. Mirrors THC's _bucket_commons_novelty() exactly.
+#         _commons_seen dedup set bounded to 4096→trim to 2048. Deposit side deferred:
+#         Elmer depositing health assessments raises LAW-7 (classifications, not raw experience)
+#         + #329/#328 tension (#329 says "deposit+bucket", but Elmer CLAUDE.md §2 says read-only
+#         and Cricket-rim is non-emitting). Josh to decide; see advisor note 2026-06-29.
+#   Why:  Elmer's only Commons connection was _arousal() (#328). Without a bucket path for
+#         NG topology metrics, Elmer has no live view of the shared substrate health since
+#         the tract feed died 2026-06-07. This restores that observation path via the Commons.
+#   How:  _pulse_cycle() → _bucket_commons_substrate() → commons.bucket_recent(limit=50,
+#         with_metadata=True) → filter metrics:neurograph:* → _surprise_from_substrate_metric()
+#         → EWMA update. Fail-soft throughout. _bucket_commons_substrate() mirrors
+#         THC's _bucket_commons_novelty() (same limit/dedup/EWMA shape). The
+#         _surprise_from_substrate_metric() reads ng_salience_gate.py's actual fields
+#         (anomaly→meta["signal"], nominal→agg["predictions_surprised"]/total) — also
+#         mirrors THC's _surprise_from_metric() exactly (healing_collective_hook.py:518).
 # [2026-06-26] Claude Code (Sonnet 4.6) — Fix LAW 7 pulse violation + restore dead _on_river_events (LAW 3)
 #   What: (1) _pulse_cycle() called process_text(f"pulse:autonomic={autonomic_state},drained={drained}")
 #         every 30s — a synthetic pre-classified label deposited into the substrate, violating LAW 7.
@@ -197,6 +215,14 @@ class ElmerHook(OpenClawAdapter):
 
         self._started = False
 
+        # --- #329 Commons bucket: NG substrate metrics ---
+        # Mirrors THC's _substrate_novelty pattern. Buckets metrics:neurograph:*
+        # from the Commons on each pulse — gives Elmer a live substrate-health
+        # feed even when tracts are dark. Deposit side deferred (LAW-7 + #329/#328
+        # tension — Josh to decide; see punchlist #329 and advisor 2026-06-29).
+        self._commons_seen: set = set()
+        self._commons_substrate_novelty: float = 1.0  # EWMA, starts high (unknown=novel)
+
         # --- #109 Pulse loop infrastructure ---
         self._shutdown_event = threading.Event()
         self._in_conversation = False
@@ -359,6 +385,60 @@ class ElmerHook(OpenClawAdapter):
         """
         # Drain tracts. Calls _on_river_events() for LAW 7-compliant absorption.
         self._drain_river()
+        # Bucket NG substrate metrics from the Commons (#329).
+        self._bucket_commons_substrate()
+
+    def _bucket_commons_substrate(self) -> None:
+        """Bucket NG substrate metrics from the Commons → _commons_substrate_novelty EWMA.
+
+        Mirrors THC's _bucket_commons_novelty(). Reads metrics:neurograph:* deposits
+        (salience-gated by NG's _metrics_gate, every ~2s on the autonomous pulse).
+        Updates _commons_substrate_novelty — an EWMA of substrate surprise visible to
+        health() and the operator. Fail-soft: bucket failures never break the pulse.
+        """
+        try:
+            from commons import get_commons
+            commons = get_commons()
+        except Exception:
+            return
+        if commons is None:
+            return
+        try:
+            recs = commons.bucket_recent(limit=50, with_metadata=True)
+        except Exception as exc:
+            logger.debug("Elmer Commons substrate bucket failed: %s", exc)
+            return
+        for target_id, _w, _r, meta in recs:
+            if not target_id.startswith("metrics:neurograph:") or target_id in self._commons_seen:
+                continue
+            self._commons_seen.add(target_id)
+            surprise = self._surprise_from_substrate_metric(meta)
+            if surprise is not None:
+                self._commons_substrate_novelty = (
+                    0.8 * self._commons_substrate_novelty + 0.2 * surprise
+                )
+        if len(self._commons_seen) > 4096:
+            self._commons_seen = set(list(self._commons_seen)[-2048:])
+
+    @staticmethod
+    def _surprise_from_substrate_metric(meta) -> "Optional[float]":
+        """Extract NG's surprise ratio from a bucketed salience-gate metric deposit.
+
+        Mirrors THC's _surprise_from_metric() exactly. Producer is ng_salience_gate.py:
+          anomaly  → meta["signal"] (the surprise ratio from the gate's own signal)
+          nominal  → predictions_surprised / (predictions_confirmed + predictions_surprised)
+        """
+        if not isinstance(meta, dict):
+            return None
+        if meta.get("salience") == "anomaly" and "signal" in meta:
+            return float(meta["signal"])
+        agg = meta.get("aggregate") if meta.get("salience") == "nominal" else None
+        if isinstance(agg, dict):
+            c = agg.get("predictions_confirmed", 0)
+            s = agg.get("predictions_surprised", 0)
+            t = c + s
+            return (s / t) if t else 0.0
+        return None
 
     def _on_river_events(self, events: list) -> None:
         """Absorb raw River topology into Elmer's substrate. Restores #154.
@@ -628,5 +708,6 @@ class ElmerHook(OpenClawAdapter):
             },
             "autonomic_state": self._arousal(),
             "coherence_status": health_signal.coherence_status,
+            "commons_substrate_novelty": round(self._commons_substrate_novelty, 4),
             "ecosystem": self.stats(),
         }
