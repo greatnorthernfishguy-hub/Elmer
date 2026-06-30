@@ -154,7 +154,7 @@ Elmer uses a socket architecture for processing units:
 | `MonitoringSocket` | Health monitoring dashboard | No |
 | `MyelinationSocket` | Oligodendrocyte — decides which tracts to myelinate | No |
 
-Sockets are managed by `SocketManager` and registered in `runtime/engine.py:start()`. `MyelinationSocket` (v0.4, 2026-03-23) extracts pathway activity patterns from the substrate and produces myelination recommendations. Apprentice-tier heuristic counts peer events from the bridge cache. Engine applies recommendations to Elmer's own tract bridge via `myelinate_tract()`/`demyelinate_tract()`. Tracts stay dumb — myelination state is runtime-only.
+Sockets are managed by `SocketManager` and registered in `runtime/engine.py:start()`. `MyelinationSocket` (v0.4, 2026-03-23; restored 2026-06-30, #326) extracts pathway activity patterns from the substrate and produces myelination recommendations. Apprentice-tier heuristic buckets `commons.bucket_recent(200)` and counts deposits per source module via `target_id` namespace convention (`_NAMESPACE_TO_MODULE` for fixed-source namespaces; segment[1] for 3-segment IDs). Engine applies recommendations to Elmer's own tract bridge via `myelinate_tract()`/`demyelinate_tract()`. Tracts stay dumb — myelination state is runtime-only.
 
 ---
 
