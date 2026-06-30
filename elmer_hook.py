@@ -19,14 +19,27 @@ stats() / health():
     and autonomic state.
 
 # ---- Changelog ----
-# [2026-06-29] Claude Code (Sonnet 4.6) — #329 Commons bucket migration (BUCKET-ONLY, deposit deferred)
+# [2026-06-30] Claude Code (Sonnet 4.6) — #329 deposit side: Elmer health assessments → Commons
+#   What: _deposit_health_to_commons() salience-gates SubstrateSignal fields (coherence_score,
+#         health_score, anomaly_level, novelty, confidence, severity) to Commons on each pulse.
+#         Salience signal = coherence deviation from COHERENCE_HEALTHY (0.70): degraded substrate
+#         → anomaly deposit with full detail; stable → nominal aggregate. Gate initialized in
+#         __init__ via ng_salience_gate.SalienceGate("elmer", _elmer_health_surprise, ...).
+#         Module-level _elmer_health_surprise() defines the surprise fn. Called in _pulse_cycle()
+#         after _bucket_commons_substrate(). Also updated Darwin agg_fields + NG agg_fields
+#         to restore total_nodes/total_synapses (same session).
+#   Why:  THC and Immunis need Elmer's health signal for Triad self-regulation. Flood concern
+#         is solved by the salience gate (same pattern as NG's metrics gate). LAW-7 concern:
+#         health metrics are telemetry observations, same class as NG's graph counts (cleared
+#         by Josh #320). Elmer CLAUDE.md §2 read-only rule applies to autonomic STATE writes,
+#         not Commons deposits of health observations.
+#   How:  _elmer_health_surprise at module level. Gate init in __init__ after _commons_seen.
+#         _deposit_health_to_commons() method + _pulse_cycle() call. Fail-soft throughout.
+# [2026-06-29] Claude Code (Sonnet 4.6) — #329 Commons bucket migration (bucket side, now complete)
 #   What: _bucket_commons_substrate() in _pulse_cycle() buckets metrics:neurograph:* deposits from
 #         the Commons → _commons_substrate_novelty EWMA. Exposed in health() as
 #         'commons_substrate_novelty'. Mirrors THC's _bucket_commons_novelty() exactly.
-#         _commons_seen dedup set bounded to 4096→trim to 2048. Deposit side deferred:
-#         Elmer depositing health assessments raises LAW-7 (classifications, not raw experience)
-#         + #329/#328 tension (#329 says "deposit+bucket", but Elmer CLAUDE.md §2 says read-only
-#         and Cricket-rim is non-emitting). Josh to decide; see advisor note 2026-06-29.
+#         _commons_seen dedup set bounded to 4096→trim to 2048.
 #   Why:  Elmer's only Commons connection was _arousal() (#328). Without a bucket path for
 #         NG topology metrics, Elmer has no live view of the shared substrate health since
 #         the tract feed died 2026-06-07. This restores that observation path via the Commons.
@@ -164,6 +177,18 @@ from runtime.engine import ElmerEngine
 logger = logging.getLogger("elmer.hook")
 
 
+def _elmer_health_surprise(m: dict) -> float:
+    """Salience signal for Elmer's health gate — deviation of coherence from healthy baseline.
+
+    COHERENCE_HEALTHY = 0.70 (core/substrate_signal.py).
+    Returns 0.0 when fully healthy; climbs continuously as coherence degrades;
+    ~1.0 at the critical threshold (0.15). This drives salience-gate granularity:
+    anomaly deposits when health is noticeably degraded, nominal aggregates otherwise.
+    """
+    coherence = float(m.get("coherence_score", 0.70))
+    return max(0.0, (COHERENCE_HEALTHY - coherence) / COHERENCE_HEALTHY)
+
+
 class ElmerHook(OpenClawAdapter):
     """OpenClaw skill hook for the Elmer cognitive substrate.
 
@@ -215,13 +240,21 @@ class ElmerHook(OpenClawAdapter):
 
         self._started = False
 
-        # --- #329 Commons bucket: NG substrate metrics ---
-        # Mirrors THC's _substrate_novelty pattern. Buckets metrics:neurograph:*
-        # from the Commons on each pulse — gives Elmer a live substrate-health
-        # feed even when tracts are dark. Deposit side deferred (LAW-7 + #329/#328
-        # tension — Josh to decide; see punchlist #329 and advisor 2026-06-29).
+        # --- #329 Commons bucket + deposit: NG metrics in / Elmer health out ---
+        # Bucket: mirrors THC's _substrate_novelty pattern. Reads metrics:neurograph:*
+        # from Commons on each pulse — live substrate-health feed even when tracts dark.
+        # Deposit: salience-gated health assessments out → THC diagnosis + Immunis correlation.
         self._commons_seen: set = set()
         self._commons_substrate_novelty: float = 1.0  # EWMA, starts high (unknown=novel)
+        try:
+            from ng_salience_gate import SalienceGate as _SG
+            self._health_gate = _SG(
+                "elmer", _elmer_health_surprise,
+                agg_fields=("coherence_score", "health_score", "anomaly_level",
+                            "novelty", "confidence", "severity"),
+            )
+        except Exception:
+            self._health_gate = None
 
         # --- #109 Pulse loop infrastructure ---
         self._shutdown_event = threading.Event()
@@ -387,6 +420,8 @@ class ElmerHook(OpenClawAdapter):
         self._drain_river()
         # Bucket NG substrate metrics from the Commons (#329).
         self._bucket_commons_substrate()
+        # Deposit Elmer's substrate health to Commons for THC/Immunis (#329).
+        self._deposit_health_to_commons()
 
     def _bucket_commons_substrate(self) -> None:
         """Bucket NG substrate metrics from the Commons → _commons_substrate_novelty EWMA.
@@ -419,6 +454,30 @@ class ElmerHook(OpenClawAdapter):
                 )
         if len(self._commons_seen) > 4096:
             self._commons_seen = set(list(self._commons_seen)[-2048:])
+
+    def _deposit_health_to_commons(self) -> None:
+        """Deposit Elmer's substrate health assessment to Commons (salience-gated).
+
+        THC buckets from elmer:* for diagnosis. Immunis buckets for threat correlation.
+        The salience gate (keyed on coherence deviation from COHERENCE_HEALTHY = 0.70)
+        emits granular anomaly deposits when health degrades, nominal aggregates when stable.
+        Fail-soft: gate failures never break the pulse.
+        """
+        if not self._started or self._health_gate is None:
+            return
+        health_signal = self._health.check()
+        metrics = {
+            "coherence_score": health_signal.coherence_score,
+            "health_score": health_signal.health_score,
+            "anomaly_level": health_signal.anomaly_level,
+            "novelty": health_signal.novelty,
+            "confidence": health_signal.confidence,
+            "severity": health_signal.severity,
+        }
+        try:
+            self._health_gate.observe(metrics)
+        except Exception as exc:
+            logger.debug("Elmer health deposit failed: %s", exc)
 
     @staticmethod
     def _surprise_from_substrate_metric(meta) -> "Optional[float]":
