@@ -21,8 +21,14 @@ through the substrate.
 
 Apprentice-tier bootstrap: until the substrate has enough data to
 make substrate-learned decisions, the socket uses a simple heuristic
-based on peer event counts from the bridge's cache.  This scaffolding
-lives here in Elmer's code, not in the tract infrastructure.
+based on recent Commons deposit frequency per source module.  This
+scaffolding lives here in Elmer's code, not in the tract infrastructure.
+
+Source attribution uses the target_id namespace convention:
+  - 3-segment IDs (metrics:neurograph:kind, health:elmer:kind, error:module:type)
+    → segment[1] is the depositing module name.
+  - 2-segment or fixed-source namespaces (topology, experience, autonomic, etc.)
+    → mapped via _NAMESPACE_TO_MODULE.
 
 # ---- Changelog ----
 # [2026-03-23] Claude (Opus 4.6) — Initial creation (punchlist #53 v0.4)
@@ -33,6 +39,18 @@ lives here in Elmer's code, not in the tract infrastructure.
 #   How:  Extracts pathway activity patterns from GraphSnapshot.
 #         Apprentice heuristic counts peer events.  Produces
 #         SubstrateSignal with myelination_recommendations metadata.
+# [2026-06-30] Claude Code (Sonnet 4.6) — #326 re-source from Commons
+#   What: _apprentice_score() now buckets recent Commons deposits and
+#         counts by source module instead of reading the deleted
+#         NGPeerBridge._peer_events field (NGPeerBridge removed 2026-06-03).
+#   Why:  getattr(bridge_ref, '_peer_events', []) always returned []
+#         after ng_peer_bridge.py was deleted → myelination socket
+#         permanently dark (0 recommendations ever fired post Phase 3).
+#   How:  _get_commons() tries self._commons_ref (test injection) then
+#         falls back to get_commons() singleton.  bucket_recent(200)
+#         gives a ~6-minute window of activity; target_id namespace
+#         parsing extracts the depositing module. set_bridge_ref()
+#         retained for engine backwards-compat but unused in heuristic.
 # -------------------
 """
 
@@ -56,9 +74,23 @@ logger = logging.getLogger("elmer.myelination")
 # Apprentice-tier thresholds (bootstrap scaffolding)
 # These live in Elmer's code, not in the tract infrastructure.
 # They graduate through the competence model (#79).
-_MIN_EVENTS_TO_RECOMMEND = 10   # Don't recommend until we've seen this many events
+_MIN_EVENTS_TO_RECOMMEND = 10   # Don't recommend until we've seen this many deposits
 _MYELINATE_PERCENTILE = 0.70    # Top 30% of peers by activity → myelinate
 _DEMYELINATE_PERCENTILE = 0.15  # Bottom 15% → demyelinate candidate
+
+# Fixed-source namespaces: target_ids in these namespaces always come from the same module.
+# For 3-segment IDs (metrics:neurograph:kind, health:elmer:kind, error:module:type)
+# segment[1] is the source module name and takes precedence over this table.
+_NAMESPACE_TO_MODULE: Dict[str, str] = {
+    "topology": "neurograph",
+    "experience": "neurograph",
+    "autonomic": "immunis",
+    "threat": "immunis",
+    "response": "immunis",
+    "perimeter": "trollguard",
+    "violation": "elmer",
+    "repair": "thc",
+}
 
 
 class MyelinationSocket(ElmerSocket):
@@ -78,7 +110,8 @@ class MyelinationSocket(ElmerSocket):
 
     def __init__(self) -> None:
         super().__init__()
-        self._peer_bridge_ref = None  # Set by engine after registration
+        self._peer_bridge_ref = None  # Retained for engine backwards-compat; not used in heuristic
+        self._commons_ref = None      # Injected in tests; production uses get_commons() singleton
 
     @property
     def socket_id(self) -> str:
@@ -109,12 +142,32 @@ class MyelinationSocket(ElmerSocket):
         logger.info("MyelinationSocket unloaded")
 
     def set_bridge_ref(self, bridge) -> None:
-        """Engine provides a reference to the peer bridge for event counts.
+        """Engine provides a reference to the peer bridge.
 
-        This is NOT a Law 1 violation — Elmer reads its own bridge's
-        cached peer events, not another module's bridge.
+        Retained for engine backwards-compat. The Apprentice heuristic no
+        longer reads _peer_events (NGPeerBridge removed 2026-06-03); it
+        buckets the Commons instead. This method is a safe no-op.
         """
         self._peer_bridge_ref = bridge
+
+    def set_commons_ref(self, commons) -> None:
+        """Inject a Commons instance for test isolation.
+
+        Production code leaves this None and _get_commons() falls back to
+        the get_commons() process singleton (in-process, always available
+        when running inside neurograph_rpc.py).
+        """
+        self._commons_ref = commons
+
+    def _get_commons(self) -> Optional[Any]:
+        """Return the Commons singleton (or test-injected mock)."""
+        if self._commons_ref is not None:
+            return self._commons_ref
+        try:
+            from commons import get_commons  # noqa: PLC0415 — in-process import
+            return get_commons()
+        except Exception:
+            return None
 
     def process(self, snapshot: GraphSnapshot, context: dict) -> SocketOutput:
         """Extract myelination recommendations from the substrate.
@@ -181,42 +234,52 @@ class MyelinationSocket(ElmerSocket):
     def _apprentice_score(
         self, snapshot: GraphSnapshot, context: dict,
     ) -> Dict[str, float]:
-        """Score each peer pathway by event frequency.
+        """Score each peer pathway by recent Commons deposit frequency.
 
-        Counts how many cached peer events came from each module_id.
-        Normalizes to [0, 1] range.  This is Apprentice scaffolding —
-        at Journeyman tier, this would read learned topology patterns
-        from the snapshot instead.
+        Buckets the last 200 Commons entries and counts deposits per source
+        module, inferred from the target_id namespace convention:
+          - 3-segment IDs (metrics:neurograph:kind, health:elmer:kind) →
+            segment[1] is the module name.
+          - Fixed-source namespaces (topology, experience, autonomic, etc.) →
+            looked up in _NAMESPACE_TO_MODULE.
+        Normalizes counts to [0, 1].  Apprentice scaffolding — at Journeyman
+        tier this would read learned topology patterns from the snapshot.
         """
-        if self._peer_bridge_ref is None:
+        commons = self._get_commons()
+        if commons is None:
             return {}
 
-        peer_events = getattr(self._peer_bridge_ref, '_peer_events', [])
-        if len(peer_events) < _MIN_EVENTS_TO_RECOMMEND:
+        try:
+            recs = commons.bucket_recent(limit=200)
+        except Exception:
             return {}
 
-        # Count events per peer.
-        # _peer_events may contain typed BTF entries (PyTopologyEntry etc.)
-        # or legacy dicts depending on whether the BTF path is active.
+        if len(recs) < _MIN_EVENTS_TO_RECOMMEND:
+            return {}
+
         counts: Dict[str, int] = {}
-        for event in peer_events:
-            mid = (
-                event.get("module_id", "")
-                if isinstance(event, dict)
-                else getattr(event, "module_id", "")
-            )
-            if mid:
-                counts[mid] = counts.get(mid, 0) + 1
+        for entry in recs:
+            target_id = entry[0] if isinstance(entry, (tuple, list)) else str(entry)
+            parts = target_id.split(":", 2)
+            namespace = parts[0]
+            if namespace in _NAMESPACE_TO_MODULE:
+                module_id = _NAMESPACE_TO_MODULE[namespace]
+            elif len(parts) >= 3:
+                # e.g. "metrics:neurograph:anomaly" → "neurograph"
+                module_id = parts[1]
+            else:
+                continue
+            if module_id:
+                counts[module_id] = counts.get(module_id, 0) + 1
 
         if not counts:
             return {}
 
-        # Normalize to [0, 1]
         max_count = max(counts.values())
         if max_count == 0:
             return {}
 
-        return {peer: count / max_count for peer, count in counts.items()}
+        return {module: count / max_count for module, count in counts.items()}
 
     def _apprentice_recommend(
         self, scores: Dict[str, float],

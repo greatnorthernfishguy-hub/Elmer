@@ -97,72 +97,88 @@ class TestMyelinationProcessing(unittest.TestCase):
 
 
 class TestApprenticeHeuristic(unittest.TestCase):
-    """Verify Apprentice-tier heuristic produces sensible recommendations."""
+    """Verify Apprentice-tier heuristic produces sensible recommendations.
+
+    Uses set_commons_ref() to inject a mock Commons — no process-singleton
+    needed, no ng_peer_bridge._peer_events (deleted 2026-06-03, #326 fix).
+    """
 
     def setUp(self):
         self.socket = MyelinationSocket()
         self.socket.load("dummy")
 
-    def _make_mock_bridge(self, peer_events):
-        """Create a mock bridge with _peer_events attribute."""
-        class MockBridge:
-            pass
-        b = MockBridge()
-        b._peer_events = peer_events
-        return b
+    def _wire_commons(self, entries):
+        """Inject a mock Commons returning the given (target_id, weight, reasoning) entries."""
+        class MockCommons:
+            def __init__(self, data):
+                self._data = data
+            def bucket_recent(self, limit=200, **_kwargs):
+                return self._data[:limit]
+        self.socket.set_commons_ref(MockCommons(entries))
 
     def test_high_activity_peer_recommended_for_myelination(self):
-        """Peer with many events should be recommended for myelination."""
-        events = []
-        # neurograph: 50 events (high activity)
+        """Module with many recent deposits should be recommended for myelination."""
+        entries = []
+        # neurograph: 50 deposits (3-segment → segment[1] = "neurograph")
         for i in range(50):
-            events.append({"module_id": "neurograph", "target_id": f"t:{i}"})
-        # bunyan: 3 events (low activity)
+            entries.append((f"metrics:neurograph:step{i}", 1.0, ""))
+        # bunyan: 3 deposits (low activity)
         for i in range(3):
-            events.append({"module_id": "bunyan", "target_id": f"b:{i}"})
+            entries.append((f"metrics:bunyan:narrate{i}", 1.0, ""))
 
-        bridge = self._make_mock_bridge(events)
-        self.socket.set_bridge_ref(bridge)
-
-        snapshot = GraphSnapshot.empty()
-        output = self.socket.process(snapshot, {})
+        self._wire_commons(entries)
+        output = self.socket.process(GraphSnapshot.empty(), {})
         recs = output.signal.metadata["myelination_recommendations"]
 
         self.assertIn("neurograph", recs["myelinate"])
 
     def test_low_activity_peer_recommended_for_demyelination(self):
-        """Peer with very few events should be a demyelination candidate."""
-        events = []
-        # immunis: 40 events
+        """Module with very few recent deposits should be a demyelination candidate."""
+        entries = []
+        # immunis: 40 deposits via autonomic namespace (fixed-source)
         for i in range(40):
-            events.append({"module_id": "immunis", "target_id": f"i:{i}"})
-        # bunyan: 2 events (very low)
+            entries.append((f"threat:immunis:scan{i}", 1.0, ""))
+        # bunyan: 2 deposits (very low — below _DEMYELINATE_PERCENTILE)
         for i in range(2):
-            events.append({"module_id": "bunyan", "target_id": f"b:{i}"})
+            entries.append((f"metrics:bunyan:log{i}", 1.0, ""))
 
-        bridge = self._make_mock_bridge(events)
-        self.socket.set_bridge_ref(bridge)
-
-        snapshot = GraphSnapshot.empty()
-        output = self.socket.process(snapshot, {})
+        self._wire_commons(entries)
+        output = self.socket.process(GraphSnapshot.empty(), {})
         recs = output.signal.metadata["myelination_recommendations"]
         scores = output.signal.metadata["pathway_scores"]
 
-        # bunyan should have a low score
         self.assertLess(scores.get("bunyan", 1.0), 0.2)
         self.assertIn("bunyan", recs["demyelinate"])
 
     def test_insufficient_data_produces_empty_recommendations(self):
-        """With fewer than MIN_EVENTS events, no recommendations."""
-        events = [{"module_id": "neurograph", "target_id": "t:1"}]  # Just 1
+        """With fewer than MIN_EVENTS deposits, no recommendations returned."""
+        # 5 entries — below _MIN_EVENTS_TO_RECOMMEND (10)
+        entries = [(f"metrics:neurograph:step{i}", 1.0, "") for i in range(5)]
 
-        bridge = self._make_mock_bridge(events)
-        self.socket.set_bridge_ref(bridge)
-
-        snapshot = GraphSnapshot.empty()
-        output = self.socket.process(snapshot, {})
+        self._wire_commons(entries)
+        output = self.socket.process(GraphSnapshot.empty(), {})
         scores = output.signal.metadata["pathway_scores"]
         self.assertEqual(scores, {})
+
+    def test_fixed_source_namespace_attribution(self):
+        """topology/experience/autonomic namespaces are attributed to the correct module."""
+        entries = []
+        for i in range(8):
+            entries.append((f"topology:hash{i}", 1.0, ""))   # → neurograph
+        for i in range(6):
+            entries.append((f"autonomic:arousal", 1.0, ""))  # → immunis
+        for i in range(4):
+            entries.append((f"repair:entry{i}", 1.0, ""))    # → thc
+
+        self._wire_commons(entries)
+        output = self.socket.process(GraphSnapshot.empty(), {})
+        scores = output.signal.metadata["pathway_scores"]
+
+        self.assertIn("neurograph", scores)
+        self.assertIn("immunis", scores)
+        self.assertIn("thc", scores)
+        # neurograph (8) should outscore thc (4)
+        self.assertGreater(scores["neurograph"], scores["thc"])
 
 
 if __name__ == "__main__":
