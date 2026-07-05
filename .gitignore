@@ -16,3 +16,9 @@ logs/
 
 # understand-anything plugin working cache (scan/intermediate/tmp artifacts — regenerable)
 .understand-anything/
+
+# Ecosystem-wide hygiene standard (repo-hygiene bot)
+data/checkpoints/
+fastembed_cache/
+node_modules/
+.neurograph/
