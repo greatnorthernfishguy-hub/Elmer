@@ -6,6 +6,10 @@ and the autonomic monitor.  Receives raw input, builds GraphSnapshots,
 routes through sockets, chains pipelines, and returns SocketOutputs.
 
 # ---- Changelog ----
+# [2026-09-11] Codex — #426 pass late Tonic providers to the existing BrainSwitcher.
+# What/Why: CC engine readiness can follow the delayed body load; discovery must retry.
+# How: forward provider registration, leaving model/resource policy with BrainSwitcher.
+
 # [2026-06-23] Claude Code (Opus 4.8) — #328 Step 2: ElmerEngine reads arousal from the Commons
 #   What: New module-level _commons_arousal() (full-dict vagus bucket); the 3 ng_autonomic.read_state()
 #         reads (process_text, _drain_loop closure, health) now use it. Module-level so it works inside
@@ -393,6 +397,12 @@ class ElmerEngine:
         """Pass tonic engine ref to BrainSwitcher for hot-swap."""
         if self._brain_switcher:
             self._brain_switcher.set_tonic_engine(tonic_engine)
+
+    def set_tonic_engine_provider(self, name, provider):
+        """Register hosted-engine discovery on the existing BrainSwitcher."""
+        if self._brain_switcher is None:
+            raise RuntimeError("BrainSwitcher unavailable for Tonic provider registration")
+        self._brain_switcher.register_tonic_engine_provider(name, provider)
 
     def load_brains(self) -> None:
         """Load brain sockets into an already-running engine.

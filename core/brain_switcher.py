@@ -15,6 +15,11 @@ Decision factors:
   - Autonomic state (SYMPATHETIC = stay light, PARASYMPATHETIC = go heavy)
 
 # ---- Changelog ----
+# [2026-09-11] Codex — #426 resolve late Tonic engines on the existing monitor.
+# What: named engine providers join the existing registry; locks precede body offers.
+# Why: CC can finish initialization after the one-shot delayed sharing attempt.
+# How: reuse monitor cadence and shared-body offer/revoke; no model load or new clock.
+# Ref: docs/handoffs/cc-shared-tonic-repair-20260911.md.
 # [2026-06-12] Claude Code (Opus 4.8, Tonic CC) — Seam C: self-heal re-offer (BrainSwitcher race fix)
 # What: _evaluate_and_switch() now, when proto is loaded ('both') and not shedding, re-offers proto's
 #   body to any registered Tonic engine still on _shared_body=None (missed the offer). Level-triggered.
@@ -103,9 +108,11 @@ class BrainSwitcher:
         self._last_switch_time: float = 0.0
         self._monitor_thread: Optional[threading.Thread] = None
         self._running = False
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # serialize registry and body lifecycle, including nested offers
         self._body_lock = threading.Lock()  # shared by proto + Tonic
         self._tonic_engines = []  # list of registered Tonic engines — see register_tonic_engine()
+        self._tonic_engine_providers = {}
+        self._unresolved_tonic_providers = set()
 
     def set_tonic_engine(self, engine) -> None:
         """Backward-compatible shim — calls register_tonic_engine()."""
@@ -121,48 +128,66 @@ class BrainSwitcher:
 
         Idempotent — re-registering the same engine is a no-op.
         """
-        if engine in self._tonic_engines:
+        if engine is None:
             return
-        self._tonic_engines.append(engine)
-        # If proto is already loaded, offer immediately to the new engine
-        if self._active_brain in ("both", "proto_unibrain", "proto_only"):
-            self._offer_body_to_single(engine)
+        with self._lock:
+            if engine in self._tonic_engines:
+                return
+            # Configure serialization BEFORE making a body visible to inference.
+            engine.set_body_lock(self._body_lock)
+            engine.set_lock_file(self._get_lock_file_path())
+            self._tonic_engines.append(engine)
+            if self._active_brain in ("both", "proto_unibrain", "proto_only"):
+                self._offer_body_to_single(engine)
+
+    def register_tonic_engine_provider(self, name, provider) -> None:
+        """Resolve a hosted Tonic that may initialize after the shared body.
+
+        Providers return an existing engine or None; they never load a body.
+        The existing monitor retries discovery, independently of conversations.
+        """
+        with self._lock:
+            self._tonic_engine_providers[name] = provider
+        self._refresh_tonic_engines()
+
+    def _refresh_tonic_engines(self) -> None:
+        with self._lock:
+            providers = tuple(self._tonic_engine_providers.items())
+        for name, provider in providers:
+            try:
+                engine = provider()
+                if engine is not None:
+                    if name in self._unresolved_tonic_providers:
+                        logger.info("Tonic provider %s became ready", name)
+                        self._unresolved_tonic_providers.discard(name)
+                    self.register_tonic_engine(engine)
+                elif name not in self._unresolved_tonic_providers:
+                    self._unresolved_tonic_providers.add(name)
+                    logger.warning("Tonic provider %s not ready; monitor will retry", name)
+            except Exception as exc:
+                logger.warning("Tonic provider %s unavailable: %s", name, exc)
 
     def _offer_body_to_single(self, engine) -> None:
-        """Offer ProtoUniBrain body to one specific engine (late registration)."""
-        try:
-            proto = self._socket_manager.get_socket("elmer:proto_unibrain")
-            if proto and getattr(proto, '_loaded', False) and getattr(proto, '_brain', None):
-                body = getattr(proto._brain, 'transformer_body', None)
-                if body is not None:
-                    engine.offer_shared_body(body)
-                    engine.set_body_lock(self._body_lock)
-                    lock_path = self._get_lock_file_path()
-                    if lock_path:
-                        engine.set_lock_file(lock_path)
-        except Exception as exc:
-            logger.debug("Failed to offer body to single engine: %s", exc)
+        """Offer the loaded body under the existing body lifecycle lock."""
+        with self._lock:
+            try:
+                proto = self._socket_manager.get_socket("elmer:proto_unibrain")
+                if proto and getattr(proto, '_loaded', False) and getattr(proto, '_brain', None):
+                    body = getattr(proto._brain, 'transformer_body', None)
+                    if body is not None:
+                        # Inference must have the locks before the first offer.
+                        engine.set_body_lock(self._body_lock)
+                        engine.set_lock_file(self._prepare_body_lock_file())
+                        if not engine.offer_shared_body(body, blocking=False):
+                            logger.info("Tonic shared-body offer deferred; monitor will retry")
+            except Exception as exc:
+                logger.warning("Failed to offer shared body to Tonic: %s", exc)
 
     def _offer_body_to_tonic(self) -> None:
         """Offer ProtoUniBrain's body to all registered Tonic engines."""
-        if not self._tonic_engines:
-            return
-        try:
-            proto = self._socket_manager.get_socket("elmer:proto_unibrain")
-            if proto and getattr(proto, '_loaded', False) and getattr(proto, '_brain', None):
-                body = getattr(proto._brain, 'transformer_body', None)
-                if body is not None:
-                    lock_path = self._get_lock_file_path()
-                    for engine in self._tonic_engines:
-                        try:
-                            engine.offer_shared_body(body)
-                            engine.set_body_lock(self._body_lock)
-                            if lock_path:
-                                engine.set_lock_file(lock_path)
-                        except Exception as exc:
-                            logger.debug("Failed to offer body to engine: %s", exc)
-        except Exception as exc:
-            logger.debug("Failed to offer body to Tonic engines: %s", exc)
+        with self._lock:
+            for engine in self._tonic_engines:
+                self._offer_body_to_single(engine)
 
     def _revoke_body_from_tonic(self) -> None:
         """Tell all Tonic engines to reload their own body — ProtoUniBrain shedding."""
@@ -198,6 +223,14 @@ class BrainSwitcher:
         """Return the path to the cross-process body access lock file."""
         return os.path.expanduser("~/.et_modules/elmer/proto_body.lock")
 
+    def _prepare_body_lock_file(self) -> str:
+        """Create the existing coordination lock before publishing a shared body."""
+        path = self._get_lock_file_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'a'):
+            pass
+        return path
+
     def _write_proto_body_status(self, available: bool) -> None:
         """Write or remove the proto body coordination file.
 
@@ -211,8 +244,7 @@ class BrainSwitcher:
             if available:
                 import json as _json
                 os.makedirs(os.path.dirname(status_path), exist_ok=True)
-                # Ensure lock file exists — flock works on any file
-                open(lock_path, 'a').close()
+                self._prepare_body_lock_file()
                 with open(status_path, 'w') as _f:
                     _json.dump({
                         "available": True,
@@ -272,6 +304,7 @@ class BrainSwitcher:
 
     def _evaluate_and_switch(self):
         """Check resources and shed ProtoUniBrain if memory gets tight."""
+        self._refresh_tonic_engines()
         resources = self._check_resources()
 
         if self._active_brain == "both":
@@ -294,23 +327,6 @@ class BrainSwitcher:
                     ", ".join(reason),
                 )
                 self._shed_proto_unibrain()
-            else:
-                # Seam C (2026-06-12, Tonic CC): self-heal. Re-offer proto's body to any
-                # registered Tonic engine that missed it (init-order race — e.g. the Tonic
-                # registered before the body attached, so it stayed on its rogue own-copy
-                # body, producing a code/doc-flavored latent thread). Level-triggered: a
-                # missed offer recovers within one check_interval, so this race can never
-                # strand the Tonic on the wrong body again. Idempotent for engines already
-                # on the shared body (only re-offers to those with _shared_body is None).
-                missed = [e for e in self._tonic_engines
-                          if getattr(e, "_shared_body", None) is None]
-                if missed:
-                    logger.info(
-                        "BrainSwitcher self-heal — re-offering proto body to %d Tonic engine(s) that missed it",
-                        len(missed),
-                    )
-                    self._offer_body_to_tonic()
-
         elif self._active_brain == "elmer_brain":
             # Try to restore ProtoUniBrain if resources recovered
             can_restore = (
@@ -328,6 +344,15 @@ class BrainSwitcher:
                     resources['cpu_load_1m'],
                 )
                 self._add_proto_unibrain()
+
+        # Re-offer in every loaded-body state, including ProtoUniBrain solo.
+        # This does not change the resource policy or load a private model.
+        if self._active_brain in ("both", "proto_unibrain", "proto_only"):
+            with self._lock:
+                missed = any(getattr(e, "_shared_body", None) is None
+                             for e in self._tonic_engines)
+            if missed:
+                self._offer_body_to_tonic()
 
     def _check_resources(self) -> Dict[str, Any]:
         """Check current VPS resource availability."""
@@ -486,6 +511,7 @@ class BrainSwitcher:
         with self._lock:
             try:
                 proto_socket = self._proto_brain_socket_cls()
+                proto_socket.set_body_lock(self._body_lock)
                 if self._ecosystem:
                     proto_socket.set_ecosystem_ref(self._ecosystem)
                 self._socket_manager.register(proto_socket)
