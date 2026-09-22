@@ -575,13 +575,19 @@ class ElmerHook(OpenClawAdapter):
         """Embed text via ng_embed (centralized ecosystem embedding).
 
         Ecosystem standard: Snowflake/snowflake-arctic-embed-m-v1.5 (768-dim).
-        ONNX Runtime, no torch dependency.
+        ONNX Runtime, no torch dependency. Fail-closed: let embed errors raise.
+
+        # ---- Changelog ----
+        # [2026-09-22] Chief CC — fail-closed _embed (Packet 022 addendum)
+        # What: Removed SHA256 hash fallback; _embed now delegates directly to ng_embed.embed.
+        # Why: Hash fallback masked EmbeddingUnavailableError and violated LAW 4. QuantumGraph
+        #      canonicalized this pattern at f03f611; Josh requested all hooks use one canonical
+        #      _embed.
+        # How: Direct import+call; exceptions propagate to caller. Tests updated.
+        # -------------------
         """
-        try:
-            from ng_embed import embed
-            return embed(text)
-        except Exception:
-            return self._hash_embed(text)
+        from ng_embed import embed
+        return embed(text)
 
     # -----------------------------------------------------------------
     # Lifecycle

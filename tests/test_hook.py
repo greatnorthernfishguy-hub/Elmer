@@ -1,5 +1,8 @@
 """Tests for ElmerHook (PRD §7, §9)."""
 
+from unittest.mock import patch
+
+import numpy as np
 import pytest
 
 from ng_ecosystem import NGEcosystem
@@ -24,8 +27,10 @@ class TestElmerHook:
         assert h1 is h2
 
     def test_on_message(self):
-        hook = ElmerHook()
-        result = hook.on_message("Hello, Elmer!")
+        fake = np.random.randn(768).astype(np.float32)
+        with patch.object(ElmerHook, "_embed", return_value=fake):
+            hook = ElmerHook()
+            result = hook.on_message("Hello, Elmer!")
         assert result["status"] == "ingested"
         assert result["tier"] >= 0
         assert "module_results" in result
