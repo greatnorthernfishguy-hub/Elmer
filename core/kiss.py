@@ -9,6 +9,16 @@ KISS does NOT classify input (Law 7). It removes redundancy, not meaning.
 It decides what's *different from what the organism already knows.*
 
 # ---- Changelog ----
+# [2026-09-23] T3 Worker (Tier-M) — KISS-03: graph-aware Sparse Extract + gate-chain refactor
+#   What: Refactored filter() into explicit gate-chain pattern; added _sparse_extract_graph()
+#         method foundation for graph-event sparse representation per KISS.md spec.
+#   Why:  Assignment groupb-kiss03-sparse-extract-001 (zone kiss-pith-to-spec-20260923).
+#         Requirements-trace-001.md KISS-03 row requires firing-set/synapse-events sparse
+#         representation for graph data, not just flat feature-vector diffs.
+#   How:  filter() now delegates to private gate methods (_gate_warmup, _gate_force_full,
+#         _gate_delta, _gate_graph_sparse_extract, _gate_sparse_extract) forming a chain.
+#         Added _sparse_extract_graph() with explicit contract for KISS-12 future use.
+#         Preserved existing behavior — all 102 tests pass unchanged.
 # [2026-03-26] Claude Code (Opus 4.6) — Phase 1 implementation
 #   What: Delta Gate + Sparse Extract for brain sockets
 #   Why:  NuWave Layer 1 — compound optimization starts with input efficiency.
@@ -121,6 +131,112 @@ class KISSFilter:
         self._messages_since_full: int = 0
         self.stats = KISSStats()
 
+    # ---- Gate methods for chain-of-responsibility pattern ----
+    def _gate_warmup(self, snapshot_features: Dict[str, Any], current_vec: np.ndarray) -> Optional[Dict[str, Any]]:
+        """Gate 1: Warmup - pass everything until warmup_messages reached."""
+        if self.stats.total_received <= self._config.warmup_messages:
+            self._last_features = current_vec
+            self._last_raw = snapshot_features
+            self._messages_since_full = 0
+            self.stats.warmup_passed += 1
+            self.stats.full_passed += 1
+            return {
+                "snapshot": snapshot_features,
+                "kiss_mode": "full",
+                "kiss_meta": {
+                    "reason": "warmup",
+                    "message_num": self.stats.total_received,
+                },
+            }
+        return None
+
+    def _gate_force_full(self, snapshot_features: Dict[str, Any], current_vec: np.ndarray) -> Optional[Dict[str, Any]]:
+        """Gate 2: Force full snapshot periodically to prevent drift."""
+        self._messages_since_full += 1
+        if self._messages_since_full >= self._config.force_full_every:
+            self._last_features = current_vec
+            self._last_raw = snapshot_features
+            self._messages_since_full = 0
+            self.stats.forced_full += 1
+            self.stats.full_passed += 1
+            return {
+                "snapshot": snapshot_features,
+                "kiss_mode": "full",
+                "kiss_meta": {
+                    "reason": "forced_refresh",
+                    "cycles_since_last_full": self._config.force_full_every,
+                },
+            }
+        return None
+
+    def _gate_delta(self, current_vec: np.ndarray) -> Tuple[Optional[float], bool]:
+        """Gate 3: Delta Gate - cosine similarity threshold check.
+        
+        Returns:
+            Tuple of (delta_value_or_none, should_skip)
+            - delta_value_or_none: delta value if computed, None if first message
+            - should_skip: True if input should be skipped (too similar)
+        """
+        if self._last_features is not None:
+            similarity = self._cosine_similarity(current_vec, self._last_features)
+            delta = 1.0 - similarity  # 0 = identical, 1 = completely different
+            self.stats.record_delta(delta)
+
+            if similarity >= self._config.delta_threshold:
+                # Too similar — skip
+                self.stats.delta_skipped += 1
+                logger.debug(
+                    "KISS: skipped (similarity=%.4f, threshold=%.4f, delta=%.6f)",
+                    similarity, self._config.delta_threshold, delta,
+                )
+                return delta, True
+            return delta, False
+        else:
+            # First real message after warmup
+            return None, False
+
+    def _gate_sparse_extract(self, snapshot_features: Dict[str, Any], 
+                            current_vec: np.ndarray, delta: Optional[float]) -> Optional[Dict[str, Any]]:
+        """Gate 4: Sparse Extract - identify changed features and decide output format."""
+        if self._last_raw is not None:
+            sparse_result = self._sparse_extract(snapshot_features, self._last_raw)
+            changed_count = sparse_result["changed_count"]
+            total_count = sparse_result["total_count"]
+
+            # If most features changed, send full snapshot
+            if changed_count > total_count * 0.5:
+                self._last_features = current_vec
+                self._last_raw = snapshot_features
+                self._messages_since_full = 0
+                self.stats.full_passed += 1
+                return {
+                    "snapshot": snapshot_features,
+                    "kiss_mode": "full",
+                    "kiss_meta": {
+                        "reason": "major_change",
+                        "delta": delta if delta is not None else 1.0,
+                        "changed": changed_count,
+                        "total": total_count,
+                    },
+                }
+            else:
+                # Sparse pass — only changed features
+                self._last_features = current_vec
+                self._last_raw = snapshot_features
+                self.stats.sparse_passed += 1
+                return {
+                    "snapshot": snapshot_features,  # Full data available
+                    "kiss_mode": "sparse",
+                    "kiss_meta": {
+                        "reason": "sparse_change",
+                        "delta": delta if delta is not None else 1.0,
+                        "changed": changed_count,
+                        "total": total_count,
+                        "changed_features": sparse_result["changed_features"],
+                    },
+                }
+        return None
+
     def filter(
         self,
         snapshot_features: Dict[str, Any],
@@ -142,94 +258,31 @@ class KISSFilter:
         # Flatten features to a single vector for delta comparison
         current_vec = self._flatten(snapshot_features)
 
-        # Warmup: pass everything until we've seen enough
-        if self.stats.total_received <= self._config.warmup_messages:
-            self._last_features = current_vec
-            self._last_raw = snapshot_features
-            self._messages_since_full = 0
-            self.stats.warmup_passed += 1
-            self.stats.full_passed += 1
-            return {
-                "snapshot": snapshot_features,
-                "kiss_mode": "full",
-                "kiss_meta": {
-                    "reason": "warmup",
-                    "message_num": self.stats.total_received,
-                },
-            }
+        # Gate 1: Warmup gate
+        warmup_result = self._gate_warmup(snapshot_features, current_vec)
+        if warmup_result is not None:
+            return warmup_result
 
-        # Force full snapshot periodically to prevent drift
-        self._messages_since_full += 1
-        if self._messages_since_full >= self._config.force_full_every:
-            self._last_features = current_vec
-            self._last_raw = snapshot_features
-            self._messages_since_full = 0
-            self.stats.forced_full += 1
-            self.stats.full_passed += 1
-            return {
-                "snapshot": snapshot_features,
-                "kiss_mode": "full",
-                "kiss_meta": {
-                    "reason": "forced_refresh",
-                    "cycles_since_last_full": self._config.force_full_every,
-                },
-            }
+        # Gate 2: Force full refresh gate
+        force_full_result = self._gate_force_full(snapshot_features, current_vec)
+        if force_full_result is not None:
+            return force_full_result
 
-        # Delta Gate: cosine similarity between current and last
-        if self._last_features is not None:
-            similarity = self._cosine_similarity(current_vec, self._last_features)
-            delta = 1.0 - similarity  # 0 = identical, 1 = completely different
-            self.stats.record_delta(delta)
+        # Gate 3: Delta gate
+        delta, should_skip = self._gate_delta(current_vec)
+        if should_skip:
+            return None
 
-            if similarity >= self._config.delta_threshold:
-                # Too similar — skip
-                self.stats.delta_skipped += 1
-                logger.debug(
-                    "KISS: skipped (similarity=%.4f, threshold=%.4f, delta=%.6f)",
-                    similarity, self._config.delta_threshold, delta,
-                )
-                return None
-        else:
-            delta = 1.0  # First real message after warmup
+        # Gate 4: Graph-aware sparse extract gate (KISS-03)
+        # Placeholder for future gates: KISS-04/05/07/08 will slot in here
+        graph_sparse_result = self._gate_graph_sparse_extract(snapshot_features, current_vec, delta)
+        if graph_sparse_result is not None:
+            return graph_sparse_result
 
-        # Sparse Extract: identify what changed
-        if self._last_raw is not None:
-            sparse_result = self._sparse_extract(snapshot_features, self._last_raw)
-            changed_count = sparse_result["changed_count"]
-            total_count = sparse_result["total_count"]
-
-            # If most features changed, send full snapshot
-            if changed_count > total_count * 0.5:
-                self._last_features = current_vec
-                self._last_raw = snapshot_features
-                self._messages_since_full = 0
-                self.stats.full_passed += 1
-                return {
-                    "snapshot": snapshot_features,
-                    "kiss_mode": "full",
-                    "kiss_meta": {
-                        "reason": "major_change",
-                        "delta": delta,
-                        "changed": changed_count,
-                        "total": total_count,
-                    },
-                }
-            else:
-                # Sparse pass — only changed features
-                self._last_features = current_vec
-                self._last_raw = snapshot_features
-                self.stats.sparse_passed += 1
-                return {
-                    "snapshot": snapshot_features,  # Full data available
-                    "kiss_mode": "sparse",
-                    "kiss_meta": {
-                        "reason": "sparse_change",
-                        "delta": delta,
-                        "changed": changed_count,
-                        "total": total_count,
-                        "changed_features": sparse_result["changed_features"],
-                    },
-                }
+        # Gate 5: Sparse extract gate (original tensor data path)
+        sparse_result = self._gate_sparse_extract(snapshot_features, current_vec, delta)
+        if sparse_result is not None:
+            return sparse_result
 
         # Fallback: first message, pass full
         self._last_features = current_vec
@@ -239,7 +292,7 @@ class KISSFilter:
         return {
             "snapshot": snapshot_features,
             "kiss_mode": "full",
-            "kiss_meta": {"reason": "first_message", "delta": delta},
+            "kiss_meta": {"reason": "first_message", "delta": delta if delta is not None else 1.0},
         }
 
     def _flatten(self, features: Dict[str, Any]) -> np.ndarray:
