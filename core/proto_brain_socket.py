@@ -9,6 +9,22 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-09-26] Claude Code (Sonnet 5) — z12-zero-bleed-fix-b: gate Lenia/Splat
+#   writes to ProtoUniBrain's own forward pass (worker-001)
+#   What: process()'s forward pass (encoder + transformer_body call) now runs
+#         inside self._lenia.capture_context(); the splat activation feed
+#         (update_activations()) is re-wrapped in its own capture_context()
+#         around just that call, since it fires after the body lock releases.
+#         SplatAdapter construction now passes lenia_wrapper=self._lenia.
+#   Why:  Packet 147(1)/audit 142 §B.4/B.8-1 — a Tonic's forward pass through
+#         the shared transformer body was writing Lenia's activation cache and
+#         the splat activation feed via the same registered hooks/calls ProtoUniBrain
+#         uses. Only ProtoUniBrain's own passes may feed growth.
+#   How:  Reuses the existing BrainSwitcher._body_lock serialization (no new
+#         locking, LAW 6) — capture_context() is a plain boolean, opened only
+#         around this socket's own forward pass and closed before the lock
+#         releases. See docs/handoffs/z12-zero-bleed-fix-b-20260925/
+#         assignments/worker-001.md.
 # [2026-05-25] CC — Lenia Phase 1: activation-coupled dynamics, body collapse reset (#252)
 #   What: (1) LeniaConfig: added noise_scale=0.2.
 #         (2) save/restore: _initial_mean_abs persisted alongside _initial_norms.
@@ -369,7 +385,13 @@ class ProtoUniBrainSocket(ElmerSocket):
                         init_sigma=0.15,
                         init_amp=0.05,
                     )
-                    self._splat_adapter = _splat_adapter_module.SplatAdapter(splat_cfg, rust_engine)
+                    # lenia_wrapper: the Python LeniaEngine (this._lenia), read
+                    # directly for the zero-bleed capture_active gate — distinct
+                    # from `rust_engine` above, which is the Rust ng_tract engine
+                    # used for the actual splat-step FFI calls.
+                    self._splat_adapter = _splat_adapter_module.SplatAdapter(
+                        splat_cfg, rust_engine, lenia_wrapper=self._lenia,
+                    )
                     # Register splat populations for transformer body layers
                     n_registered = 0
                     for name, param in self._brain.transformer_body.named_parameters():
@@ -455,25 +477,35 @@ class ProtoUniBrainSocket(ElmerSocket):
             _body_ctx = self._body_lock if self._body_lock is not None else contextlib.nullcontext()
 
             with _body_ctx:
-                # Forward pass — get raw hidden state, NOT decoder output
-                with _torch.no_grad():
-                    _topo = latest_delta.get("topology") if isinstance(latest_delta, dict) else None
-                    _outcomes = latest_delta.get("outcomes") if isinstance(latest_delta, dict) else None
-                    inputs_embeds = self._brain.encoder(
-                        topology_delta=_topo,
-                        outcome_embeddings=_outcomes,
-                        autonomic_state=autonomic,
-                    )
-                    body_output = self._brain.transformer_body(
-                        input_ids=None,
-                        inputs_embeds=inputs_embeds,
-                        use_cache=False,
-                        output_hidden_states=True,
-                    )
-                    # Raw hidden state — full sequence, no pooling, no decoder
-                    raw_hidden = body_output.last_hidden_state  # (1, seq_len, 896)
-                    # All layer hidden states for per-layer measurement
-                    all_hidden = body_output.hidden_states  # tuple of (1, seq_len, 896) x 25
+                # Zero-bleed gate (z12-zero-bleed-fix-b): only ProtoUniBrain's own
+                # forward pass through the shared body may write Lenia's activation
+                # cache. Tonics call this same transformer_body under the same
+                # registered hooks (via tonic_engine.py's own lock-protected pass)
+                # but never open capture_context(), so the hook no-ops for them by
+                # construction. Must close before the lock releases below — a
+                # Tonic waiting on _body_lock must never observe capture_active
+                # True. See docs/handoffs/z12-zero-bleed-fix-b-20260925/
+                # assignments/worker-001.md §2c.
+                with self._lenia.capture_context():
+                    # Forward pass — get raw hidden state, NOT decoder output
+                    with _torch.no_grad():
+                        _topo = latest_delta.get("topology") if isinstance(latest_delta, dict) else None
+                        _outcomes = latest_delta.get("outcomes") if isinstance(latest_delta, dict) else None
+                        inputs_embeds = self._brain.encoder(
+                            topology_delta=_topo,
+                            outcome_embeddings=_outcomes,
+                            autonomic_state=autonomic,
+                        )
+                        body_output = self._brain.transformer_body(
+                            input_ids=None,
+                            inputs_embeds=inputs_embeds,
+                            use_cache=False,
+                            output_hidden_states=True,
+                        )
+                        # Raw hidden state — full sequence, no pooling, no decoder
+                        raw_hidden = body_output.last_hidden_state  # (1, seq_len, 896)
+                        # All layer hidden states for per-layer measurement
+                        all_hidden = body_output.hidden_states  # tuple of (1, seq_len, 896) x 25
 
                 # Lenia dynamics step — THE LEARNING
                 # Must hold lock: writes to the same weight tensors Tonic reads
@@ -503,7 +535,13 @@ class ProtoUniBrainSocket(ElmerSocket):
                                 if layer_idx is not None and layer_idx < len(all_hidden):
                                     lh = all_hidden[layer_idx].squeeze(0)
                                     layer_activations[name] = float(lh.norm() / max(lh.numel() ** 0.5, 1.0))
-                        self._splat_adapter.update_activations(layer_activations)
+                        # Zero-bleed gate: this feed is ProtoUniBrain's own — the
+                        # lock was already released above, so re-open the same
+                        # capture flag SplatAdapter reads directly (§2b, option a)
+                        # only around the write itself, keeping the window as
+                        # narrow as the data dependency allows.
+                        with self._lenia.capture_context():
+                            self._splat_adapter.update_activations(layer_activations)
                     splat_metrics = self._splat_adapter.step()
                     self._splat_step_count += 1
                     if self._splat_step_count % 10 == 0:
