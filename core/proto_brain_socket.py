@@ -27,7 +27,7 @@ reference. This one is alive and learning.
 #         experience into its own Commons medium. The text is re-embedded at the bucket because the Commons'
 #         NG-Lite merges near-identical deposits onto shared pattern nodes (the CC medium: 3,779 deposits on 4
 #         nodes, so with_embedding alone returns 4 distinct vectors). Embedding at extraction is LAW 7.
-#   How:  bounded bucket (_RIVER_BUCKET_LIMIT newest new deposits per cycle), outside the body lock as before;
+#   How:  bounded bucket (_RIVER_BUCKET_LIMIT = 4 newest new deposits per cycle), outside the body lock as before;
 #         fail-soft (None = the encoder's idle path, exactly what an empty River gives). The tract + cursor reader
 #         is removed, not left beside it (LAW 3).
 # [2026-10-11] Claude Code (Opus 5.5, lane flow-lenia-f1) — host hooks for Flow-Lenia F1 (inert unless F1 is on)
@@ -192,9 +192,12 @@ _WEIGHT_STATS_LOG_PATH = os.path.expanduser("~/.elmer/weight_stats.jsonl")
 _ADAPTER_STUCK_THRESHOLD = 200     # consecutive saturated steps before kick
 _ADAPTER_SAT_THRESHOLD = 0.75      # fraction of decoder signals pegged at 0/1 = stuck
 
-# River bucket width: at most this many of the newest not-yet-seen Commons deposits per process() cycle
-# (the CC deposits about one per minute; the cap bounds the embed work after a restart or a burst).
-_RIVER_BUCKET_LIMIT = 16
+# River bucket width: at most this many of the newest not-yet-seen Commons deposits per process() cycle.
+# The CC deposits about one per minute (one per 60 s drain cycle); each text deposit is embedded here, and
+# ng_embed measured 5.7 s per ~1.6 kB CC text on this laptop (warm, nice 10, live daemon running), so the cap
+# bounds the extra work outside the body lock to ~25 s after a restart or a burst. Older entries of a burst
+# beyond the cap are skipped (the watermark moves to the newest): the bucket samples the stream.
+_RIVER_BUCKET_LIMIT = 4
 
 
 def _lazy_imports():
@@ -1018,29 +1021,10 @@ class ProtoUniBrainSocket(ElmerSocket):
                 return None
             embeddings = []
             newest = self._river_since
-            embed = None
             for row in reversed(rows):           # bucket_recent is newest first; the encoder wants oldest first
-                tid, _w, reasoning, meta, emb = row[:5]
-                try:
-                    ts = float(str(reasoning).rsplit("@", 1)[1])
-                except Exception:
-                    ts = self._river_since
-                newest = max(newest, ts)
-                text = ""
-                if isinstance(meta, dict):
-                    text = "\n\n".join(str(meta[k]) for k in ("text", "user_text", "assistant_text")
-                                         if meta.get(k))
-                vec = None
-                if text:
-                    if embed is None:
-                        from ng_embed import embed
-                    vec = embed(text)
-                elif emb is not None:
-                    vec = emb
-                if vec is None:
-                    continue
-                vec = np.asarray(vec, dtype=np.float32).reshape(-1)
-                if vec.size:
+                ts, vec = self._river_row_vector(row)
+                newest = max(newest, ts if ts is not None else newest)
+                if vec is not None:
                     embeddings.append(vec)
             self._river_since = newest
             if not embeddings:
@@ -1053,6 +1037,33 @@ class ProtoUniBrainSocket(ElmerSocket):
             logger.error("River read failed: %s", exc)
             return None
 
+
+    @staticmethod
+    def _river_row_vector(row):
+        """One Commons recency-bucket row -> (deposit timestamp or None, 768-d float32 vector or None).
+
+        The deposit's raw text (metadata text / user_text / assistant_text) embedded with ng_embed when it
+        carries text (LAW 7: interpretation at the bucket), else the deposit's own embedding. Shared with the
+        F0 tool (scripts/proto_flow_f0_restore.py --commons) so the probe sees the River exactly as process() does.
+        """
+        _tid, _w, reasoning, meta, emb = row[:5]
+        try:
+            ts = float(str(reasoning).rsplit("@", 1)[1])
+        except Exception:
+            ts = None
+        text = ""
+        if isinstance(meta, dict):
+            text = "\n\n".join(str(meta[k]) for k in ("text", "user_text", "assistant_text") if meta.get(k))
+        vec = None
+        if text:
+            from ng_embed import embed
+            vec = embed(text)
+        elif emb is not None:
+            vec = emb
+        if vec is None:
+            return ts, None
+        vec = np.asarray(vec, dtype=np.float32).reshape(-1)
+        return ts, (vec if vec.size else None)
 
     def health(self) -> SocketHealth:
         h = self._make_health("healthy" if self._loaded else "offline")

@@ -22,6 +22,13 @@ body and the borrowed LM at once):
   python proto_flow_f0_restore.py --stage init --out i.json
 
 # ---- Changelog ----
+# [2026-10-11] Claude Code (Opus 5.5, lane river-feed-fix) — --commons: the probe from the River the proto now reads
+#   What: --commons <copy of a Commons checkpoint> [--commons-entries N]: the probe's real windows come from the newest
+#         N deposits of that medium, turned into encoder outcomes by the socket's own _river_row_vector (raw text
+#         embedded at the bucket, else the deposit embedding) -- exactly what process() feeds the encoder. --traffic
+#         (a tract copy) stays for comparison; exactly one of the two is required for --stage restore.
+#   Why:  the proto's River is the Commons (proto_brain_socket._read_river_delta), so usage0 must be measured on it.
+#   How:  commons.Commons().restore(copy) + bucket_recent(limit=N, with_embedding=True), oldest first.
 # [2026-10-11] Claude Code (Opus 5.5, lane flow-lenia-f1) — created
 #   What: the F0 restore + F1 initialisation as an operator tool on a copy (design §8 F0, §9 R1).
 #   Why:  docs superpowers/specs/2026-10-11-proto-flow-lenia-design.md: "Archive the current body;
@@ -62,6 +69,20 @@ def read_outcomes(tract_path):
     return out
 
 
+def read_commons_outcomes(path, n):
+    """The newest n deposits of a Commons checkpoint copy, oldest first, as the proto's River bucket sees them."""
+    from commons import Commons
+    from core.proto_brain_socket import ProtoUniBrainSocket
+    medium = Commons()
+    medium.restore(path)
+    out = []
+    for row in reversed(medium.bucket_recent(limit=n, with_embedding=True)):
+        _ts, vec = ProtoUniBrainSocket._river_row_vector(row)
+        if vec is not None:
+            out.append(vec)
+    return out
+
+
 def probe_windows(n):
     """Windows over the n real entries, in deposit order: sizes 1, 2, 4, 8, 16, 32 with 50 % overlap."""
     wins = []
@@ -79,6 +100,8 @@ def main(argv=None):
                     help="restore: reset body + persist probe inputs/tokens + save; then run lenia/flow_probe.py on "
                          "the saved body (its own process) for the baselines; init: F0 capture with those baselines")
     ap.add_argument("--traffic", help="(restore) copy of a River tract with the CC's OUTCOME entries")
+    ap.add_argument("--commons", help="(restore) copy of a Commons checkpoint (the River the proto reads)")
+    ap.add_argument("--commons-entries", type=int, default=32, help="newest deposits of --commons in the probe")
     ap.add_argument("--tokenizer", help="(restore) Qwen2.5 tokenizer dir")
     ap.add_argument("--docs", default=os.path.expanduser("~/docs"))
     ap.add_argument("--out", required=True)
@@ -106,11 +129,12 @@ def main(argv=None):
     os.makedirs(flow.cfg.state_dir, exist_ok=True)
 
     if a.stage == "restore":
-        assert a.traffic and a.tokenizer, "--traffic and --tokenizer are required for --stage restore"
+        assert bool(a.traffic) != bool(a.commons) and a.tokenizer, \
+            "--stage restore needs --tokenizer and exactly one of --traffic / --commons"
         probe_mod = _load_by_path("uniai_flow_probe", os.path.join(
             os.path.dirname(sys.modules["lenia_engine"].__file__), "flow_probe.py"))
-        outcomes = read_outcomes(a.traffic)
-        rep["traffic"] = a.traffic
+        outcomes = read_outcomes(a.traffic) if a.traffic else read_commons_outcomes(a.commons, a.commons_entries)
+        rep["traffic"] = a.traffic or a.commons
         rep["traffic_outcomes"] = len(outcomes)
         inputs, kinds = [], []
         with torch.no_grad():
@@ -123,7 +147,7 @@ def main(argv=None):
                 inputs.append(sock._brain.encoder(topology_delta=None, outcome_embeddings=outcomes[i:j],
                                                   autonomic_state="PARASYMPATHETIC"))
                 kinds.append("outcome")
-        torch.save({"inputs": inputs, "kinds": kinds, "traffic": a.traffic,
+        torch.save({"inputs": inputs, "kinds": kinds, "traffic": a.traffic or a.commons,
                     "windows": probe_windows(len(outcomes))}, os.path.join(flow.cfg.state_dir, "probe_inputs.pt"))
         rep["probe_inputs"] = {"n": len(inputs), "idle": kinds.count("idle"), "outcome": kinds.count("outcome"),
                                "tokens": int(sum(x.shape[1] for x in inputs))}
