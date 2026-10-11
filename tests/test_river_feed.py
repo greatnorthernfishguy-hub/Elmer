@@ -5,7 +5,7 @@ ELMER_WORKSPACE_DIR-scoped instance files (#1075 / #1079).
 # ---- Changelog ----
 # [2026-10-11] Claude Code (Opus 5.5, lane river-feed-fix) — created
 #   What: _read_river_delta() buckets the Commons (watermark, oldest-first order, raw text embedded at the bucket,
-#         embedding fallback, bounded); deposits use the canonical deposit_experience(raw, source, tract_paths)
+#         embedding fallback, bounded, no re-delivery from the ms-rounded recency); deposits use the canonical deposit_experience(raw, source, tract_paths)
 #         shape under ET_TRACTS_DIR; instance_paths defaults are byte-identical when the variables are unset.
 #   Why:  the River moved to the Commons (no tracts/neurograph/<peer>.tract writer exists); LAW 5 path scoping.
 #   How:  fake `commons`, `ng_embed` and `ng_tract` modules in sys.modules; no torch, no model load.
@@ -39,7 +39,7 @@ class _FakeCommons:
         for tid, ts, meta, emb in sorted(self.rows, key=lambda r: r[1], reverse=True):
             if ts <= since:
                 break
-            out.append((tid, 0.5, f"recency@{ts:.3f}", meta, emb))
+            out.append((tid, 0.5, f"recency@{ts:.3f}", meta, emb))   # rounded to the ms, as commons.Commons
             if len(out) >= limit:
                 break
         return out
@@ -81,11 +81,11 @@ def test_new_deposits_reach_encoder_oldest_first_and_watermark_advances(river):
     assert len(d["outcomes"]) == 2
     assert embedded == ["first", "second turn"]          # oldest first, raw text embedded at the bucket
     assert all(v.shape == (768,) and v.dtype == np.float32 for v in d["outcomes"])
-    assert sock._river_since == pytest.approx(200.0)
+    assert sock._river_since == pytest.approx(200.0005)
     assert medium.calls[-1]["with_embedding"] is True
     # nothing new -> idle; the watermark is passed to the bucket
     assert sock._read_river_delta() is None
-    assert medium.calls[-1]["since"] == pytest.approx(200.0)
+    assert medium.calls[-1]["since"] == pytest.approx(200.0005)
     medium.add("cc:experience:c", 300.0, {"text": "third"}, None)
     d = sock._read_river_delta()
     assert len(d["outcomes"]) == 1 and embedded[-1] == "third"
@@ -103,7 +103,19 @@ def test_textless_deposit_uses_its_embedding_and_experience_halves_are_joined(ri
     assert len(d["outcomes"]) == 2
     np.testing.assert_array_equal(d["outcomes"][0], emb.astype(np.float32))
     assert embedded == ["hi\n\nhello"]
-    assert sock._river_since == pytest.approx(30.0)
+    assert sock._river_since == pytest.approx(30.0005)
+
+
+def test_ms_rounded_recency_does_not_redeliver(river):
+    """bucket_recent prints the recency rounded to 3 decimals; the watermark must not re-read the same deposit."""
+    medium, embedded = river
+    medium.add("cc:experience:a", 1791754897.38149, {"text": "once"}, None)   # prints as ...897.381 (< real ts)
+    sock = ProtoUniBrainSocket()
+    assert len(sock._read_river_delta()["outcomes"]) == 1
+    assert sock._read_river_delta() is None
+    assert embedded == ["once"]
+    medium.add("cc:experience:b", 1791754897.3830, {"text": "next"}, None)
+    assert len(sock._read_river_delta()["outcomes"]) == 1 and embedded[-1] == "next"
 
 
 def test_bucket_is_bounded(river):

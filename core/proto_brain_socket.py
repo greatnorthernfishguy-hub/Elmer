@@ -1040,7 +1040,7 @@ class ProtoUniBrainSocket(ElmerSocket):
 
     @staticmethod
     def _river_row_vector(row):
-        """One Commons recency-bucket row -> (deposit timestamp or None, 768-d float32 vector or None).
+        """One Commons recency-bucket row -> (deposit timestamp upper edge or None, 768-d float32 vector or None).
 
         The deposit's raw text (metadata text / user_text / assistant_text) embedded with ng_embed when it
         carries text (LAW 7: interpretation at the bucket), else the deposit's own embedding. Shared with the
@@ -1048,7 +1048,10 @@ class ProtoUniBrainSocket(ElmerSocket):
         """
         _tid, _w, reasoning, meta, emb = row[:5]
         try:
-            ts = float(str(reasoning).rsplit("@", 1)[1])
+            # Commons.bucket_recent reports the recency as "recency@<ts:.3f>" (rounded to the ms), so the real
+            # last_updated can lie up to 0.5 ms above the printed value: return the upper edge, or a since=<ts>
+            # watermark would hand the same deposit back on the next cycle.
+            ts = float(str(reasoning).rsplit("@", 1)[1]) + 0.0005
         except Exception:
             ts = None
         text = ""
