@@ -9,6 +9,18 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-10-11] Claude Code (Opus 5.5, lane flow-lenia-f1) — host hooks for Flow-Lenia F1 (inert unless F1 is on)
+#   What: (1) process(): the forward runs inside self._lenia.capture_context() when the engine has it (zero-bleed:
+#             only this socket's own forward feeds F1's usage, never a Tonic's); step() gets the arousal string
+#             (read-only) when F1 is active; F1 detector events are deposited raw to the River after the lock.
+#         (2) save_evolved_weights(): the F1 engine state goes into proto_weights.pt under 'flow_lenia_f1', in the
+#             same torch.save as the body, so mass and weights can never disagree on disk.
+#         (3) _restore_evolved_weights(): hands that state back to the engine (it validates it against the body).
+#         (4) _reset_body_to_pretrained(): tells the engine (mass back to m = 1).
+#   Why:  docs superpowers/specs/2026-10-11-proto-flow-lenia-design.md §4.1 (zero-bleed), §5.4 (raw deposit),
+#         F1 engine state "saved alongside the body". UniAI lenia/engine.py is the only dynamics code (LAW 4).
+#   How:  every call is guarded by hasattr / flow_f1_active, so an old engine.py and F1-off behave exactly as
+#         before (Phase 1 hooks never read the capture flag). The CRISPR kick and SplatAdapter are unchanged.
 # [2026-05-25] CC — Lenia Phase 1: activation-coupled dynamics, body collapse reset (#252)
 #   What: (1) LeniaConfig: added noise_scale=0.2.
 #         (2) save/restore: _initial_mean_abs persisted alongside _initial_norms.
@@ -121,6 +133,7 @@ reference. This one is alive and learning.
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import logging
 import os
@@ -454,9 +467,13 @@ class ProtoUniBrainSocket(ElmerSocket):
             import contextlib
             _body_ctx = self._body_lock if self._body_lock is not None else contextlib.nullcontext()
 
+            _capture = getattr(self._lenia, "capture_context", None)
+            _capture_ctx = _capture() if _capture is not None else contextlib.nullcontext()
+            _flow_f1 = bool(getattr(self._lenia, "flow_f1_active", False))
+
             with _body_ctx:
                 # Forward pass — get raw hidden state, NOT decoder output
-                with _torch.no_grad():
+                with _torch.no_grad(), _capture_ctx:
                     _topo = latest_delta.get("topology") if isinstance(latest_delta, dict) else None
                     _outcomes = latest_delta.get("outcomes") if isinstance(latest_delta, dict) else None
                     inputs_embeds = self._brain.encoder(
@@ -477,8 +494,11 @@ class ProtoUniBrainSocket(ElmerSocket):
 
                 # Lenia dynamics step — THE LEARNING
                 # Must hold lock: writes to the same weight tensors Tonic reads
-                lenia_metrics = self._lenia.step()
+                lenia_metrics = self._lenia.step(arousal=autonomic) if _flow_f1 else self._lenia.step()
                 self._lenia_steps += 1
+
+            if _flow_f1:
+                self._deposit_flow_events()
 
             # Splat adapter step — runs OUTSIDE the body lock.
             # Splat arrays are separate from transformer weight tensors.
@@ -643,6 +663,27 @@ class ProtoUniBrainSocket(ElmerSocket):
                 processing_time=elapsed,
             )
 
+    def _deposit_flow_events(self) -> None:
+        """Flow-Lenia F1 detector events, raw (LAW 7): the numbers the detector saw, on the proto latent tract."""
+        try:
+            events = self._lenia.drain_flow_events()
+            if not events:
+                return
+            import json
+            import ng_tract
+            tract_dir = os.path.expanduser("~/.et_modules/tracts/proto_unibrain")  # same tract as _deposit_to_river
+            os.makedirs(tract_dir, exist_ok=True)
+            tract_path = os.path.join(tract_dir, "latent.tract")
+            for ev in events:
+                ng_tract.deposit_experience(
+                    source="proto_unibrain",
+                    content_type="flow_lenia_event",
+                    content=json.dumps(ev, default=float).encode(),
+                    tract_paths=[tract_path],
+                )
+        except Exception as exc:
+            logger.warning("Flow-Lenia event deposit failed: %s", exc)
+
     def _deposit_to_river(self, hidden_state):
         """Deposit raw hidden state to the River as BTF experience entry.
 
@@ -786,6 +827,8 @@ class ProtoUniBrainSocket(ElmerSocket):
         self._lenia._initial_norms.clear()
         if hasattr(self._lenia, '_initial_mean_abs'):
             self._lenia._initial_mean_abs.clear()
+        if hasattr(self._lenia, 'flow_on_body_reset'):
+            self._lenia.flow_on_body_reset()  # Flow-Lenia F1: W = W0 again, so mass m = 1
 
         logger.info(
             "ProtoUniBrain: body reset to pretrained (%d params restored). Lenia baselines cleared.",
@@ -824,6 +867,8 @@ class ProtoUniBrainSocket(ElmerSocket):
             saved = _torch.load(_PROTO_WEIGHTS_PATH, map_location="cpu", weights_only=False)
             self._brain.load_state_dict(saved['model_state_dict'], strict=False)
             self._lenia_steps = saved.get('lenia_steps', 0)
+            if getattr(self._lenia, 'flow_f1_active', False):
+                self._lenia.load_flow_state(saved.get('flow_lenia_f1'))
             logger.info(
                 "ProtoUniBrain: restored evolved weights (step %d, saved %s)",
                 self._lenia_steps,
@@ -853,12 +898,16 @@ class ProtoUniBrainSocket(ElmerSocket):
 
         try:
             from datetime import datetime
-            _torch.save({
+            _saved = {
                 'model_state_dict': self._brain.state_dict(),
                 'lenia_steps': self._lenia_steps,
                 'timestamp': datetime.now().isoformat(),
                 'process_count': self._process_count,
-            }, _PROTO_WEIGHTS_PATH)
+            }
+            _flow_state = self._lenia.flow_state_dict() if hasattr(self._lenia, 'flow_state_dict') else None
+            if _flow_state is not None:
+                _saved['flow_lenia_f1'] = _flow_state  # F1 mass/usage/graph, atomically with the body
+            _torch.save(_saved, _PROTO_WEIGHTS_PATH)
 
             # Save Lenia state (baselines for Phase 1 activation-coupled dynamics)
             if self._lenia:
