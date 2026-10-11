@@ -15,6 +15,12 @@ Decision factors:
   - Autonomic state (SYMPATHETIC = stay light, PARASYMPATHETIC = go heavy)
 
 # ---- Changelog ----
+# [2026-10-11] Claude Code (Opus 5.5, lane river-feed-fix) — #1075 instance-scoped body lock + status file
+# What: proto_body.lock and proto_body_status.json resolve through core.instance_paths.instance_file: under
+#       $ELMER_WORKSPACE_DIR when it is set, else ~/.et_modules/elmer/ exactly as before.
+# Why: the CC's Elmer wrote Syl-scoped coordination paths (punch list #1075). The Tonic gets the lock path from
+#      here (engine.set_lock_file), so this one resolution keeps both sides on the same file.
+# How: _get_lock_file_path() / _write_proto_body_status() call instance_file(); no new variable.
 # [2026-09-11] Codex — #426 resolve late Tonic engines on the existing monitor.
 # What: named engine providers join the existing registry; locks precede body offers.
 # Why: CC can finish initialization after the one-shot delayed sharing attempt.
@@ -63,6 +69,8 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
+
+from core.instance_paths import instance_file
 
 logger = logging.getLogger("elmer.brain_switcher")
 
@@ -221,7 +229,7 @@ class BrainSwitcher:
 
     def _get_lock_file_path(self) -> str:
         """Return the path to the cross-process body access lock file."""
-        return os.path.expanduser("~/.et_modules/elmer/proto_body.lock")
+        return instance_file("~/.et_modules/elmer/proto_body.lock", "proto_body.lock")
 
     def _prepare_body_lock_file(self) -> str:
         """Create the existing coordination lock before publishing a shared body."""
@@ -238,7 +246,7 @@ class BrainSwitcher:
         is loaded so in-process and future cross-process Tonic consumers can
         discover the body and lock file path. Removes the file when shed.
         """
-        status_path = os.path.expanduser("~/.et_modules/elmer/proto_body_status.json")
+        status_path = instance_file("~/.et_modules/elmer/proto_body_status.json", "proto_body_status.json")
         lock_path = self._get_lock_file_path()
         try:
             if available:

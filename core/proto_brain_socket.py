@@ -9,6 +9,27 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-10-11] Claude Code (Opus 5.5, lane river-feed-fix) — the River reaches the proto: bucket the Commons
+#   What: (1) _read_river_delta() (same name, same return shape, LAW 3 restore in place) buckets the process's
+#             Commons — get_commons().bucket_recent(since=<watermark>, with_embedding=True) — instead of reading
+#             tracts/neurograph/proto_unibrain.tract. Each new deposit becomes one 768-d outcome embedding for the
+#             encoder, oldest first: the deposit's raw text (metadata text / user_text / assistant_text) embedded
+#             here with ng_embed, else the deposit's own embedding. The watermark advances in memory.
+#         (2) _deposit_to_river() / _deposit_flow_events(): the tract dir comes from ET_TRACTS_DIR
+#             (core.instance_paths.tracts_root, the vendored bridge's resolution) and the call uses the canonical
+#             wheel's shape deposit_experience(raw, source, tract_paths) (#1079); the first failure is a WARNING.
+#         (3) the CRISPR-kick log (competence_delta.jsonl) follows ELMER_WORKSPACE_DIR when it is set (#1075).
+#   Why:  Nothing writes tracts/neurograph/<peer>.tract any more. NeuroGraph's _deposit_topology_to_river /
+#         _deposit_experience_to_river / _deposit_outcome_to_river deposit into the ONE Commons since Commons
+#         Track 2 (2026-06-11 / 06-14 / 06-24: "DO NOT re-enable as addressed fan-out"); [[The Commons]] lists
+#         Elmer as "orphaned-on-tracts, pending migration". So on every host the proto read a dead inbox and its
+#         encoder saw the idle sequence every cycle. The CC NeuroGraph has peer_bridge disabled and deposits its
+#         experience into its own Commons medium. The text is re-embedded at the bucket because the Commons'
+#         NG-Lite merges near-identical deposits onto shared pattern nodes (the CC medium: 3,779 deposits on 4
+#         nodes, so with_embedding alone returns 4 distinct vectors). Embedding at extraction is LAW 7.
+#   How:  bounded bucket (_RIVER_BUCKET_LIMIT newest new deposits per cycle), outside the body lock as before;
+#         fail-soft (None = the encoder's idle path, exactly what an empty River gives). The tract + cursor reader
+#         is removed, not left beside it (LAW 3).
 # [2026-10-11] Claude Code (Opus 5.5, lane flow-lenia-f1) — host hooks for Flow-Lenia F1 (inert unless F1 is on)
 #   What: (1) process(): the forward runs inside self._lenia.capture_context() when the engine has it (zero-bleed:
 #             only this socket's own forward feeds F1's usage, never a Tonic's); step() gets the arousal string
@@ -150,6 +171,7 @@ from core.base_socket import (
     SocketOutput,
 )
 from core.substrate_signal import SubstrateSignal
+from core.instance_paths import instance_file, tracts_root
 
 logger = logging.getLogger("elmer.proto_brain")
 
@@ -163,12 +185,16 @@ _splat_adapter_module = None
 # Persistence paths — proto brain survives restarts
 _PROTO_WEIGHTS_PATH = os.path.expanduser("~/.elmer/proto_weights.pt")
 _PROTO_LENIA_STATE_PATH = os.path.expanduser("~/.elmer/proto_lenia_state.pt")
-_DELTA_LOG_PATH = os.path.expanduser("~/.elmer/competence_delta.jsonl")
+_DELTA_LOG_DEFAULT = "~/.elmer/competence_delta.jsonl"   # resolved per call (ELMER_WORKSPACE_DIR, #1075)
 _WEIGHT_STATS_LOG_PATH = os.path.expanduser("~/.elmer/weight_stats.jsonl")
 
 # Adapter pressure monitoring (Morphogenesis-inspired CRISPR kick)
 _ADAPTER_STUCK_THRESHOLD = 200     # consecutive saturated steps before kick
 _ADAPTER_SAT_THRESHOLD = 0.75      # fraction of decoder signals pegged at 0/1 = stuck
+
+# River bucket width: at most this many of the newest not-yet-seen Commons deposits per process() cycle
+# (the CC deposits about one per minute; the cap bounds the embed work after a restart or a burst).
+_RIVER_BUCKET_LIMIT = 16
 
 
 def _lazy_imports():
@@ -254,6 +280,10 @@ class ProtoUniBrainSocket(ElmerSocket):
         self._adapter_stuck_steps = 0
         self._adapter_kick_count = 0
         self._adapter_sat_frac = 0.0
+        self._river_since = 0.0          # Commons recency watermark (newest deposit already read)
+        self._river_reads = 0            # cycles that delivered River entries
+        self._river_entries = 0          # entries delivered in total
+        self._deposit_warned = False
 
     def set_body_lock(self, lock) -> None:
         """Set the shared body access lock (from BrainSwitcher)."""
@@ -671,18 +701,19 @@ class ProtoUniBrainSocket(ElmerSocket):
                 return
             import json
             import ng_tract
-            tract_dir = os.path.expanduser("~/.et_modules/tracts/proto_unibrain")  # same tract as _deposit_to_river
-            os.makedirs(tract_dir, exist_ok=True)
-            tract_path = os.path.join(tract_dir, "latent.tract")
+            tract_path = self._latent_tract_path()   # same tract as _deposit_to_river
             for ev in events:
-                ng_tract.deposit_experience(
-                    source="proto_unibrain",
-                    content_type="flow_lenia_event",
-                    content=json.dumps(ev, default=float).encode(),
-                    tract_paths=[tract_path],
-                )
+                # canonical wheel shape: deposit_experience(raw, source, tract_paths) (#1079)
+                ng_tract.deposit_experience(json.dumps(ev, default=float).encode(), "proto_unibrain", [tract_path])
         except Exception as exc:
             logger.warning("Flow-Lenia event deposit failed: %s", exc)
+
+    @staticmethod
+    def _latent_tract_path() -> str:
+        """proto's latent tract: <tracts root>/proto_unibrain/latent.tract, the root from ET_TRACTS_DIR."""
+        tract_dir = os.path.join(tracts_root(), "proto_unibrain")
+        os.makedirs(tract_dir, exist_ok=True)
+        return os.path.join(tract_dir, "latent.tract")
 
     def _deposit_to_river(self, hidden_state):
         """Deposit raw hidden state to the River as BTF experience entry.
@@ -696,19 +727,14 @@ class ProtoUniBrainSocket(ElmerSocket):
             raw = hidden_state.squeeze(0).detach().cpu().numpy()
             content_bytes = raw.tobytes()
 
-            # Deposit to latent tract
-            tract_dir = os.path.expanduser("~/.et_modules/tracts/proto_unibrain")
-            os.makedirs(tract_dir, exist_ok=True)
-            tract_path = os.path.join(tract_dir, "latent.tract")
-
-            ng_tract.deposit_experience(
-                source="proto_unibrain",
-                content_type="latent_state",
-                content=content_bytes,
-                tract_paths=[tract_path],
-            )
+            # Deposit to latent tract — canonical wheel shape deposit_experience(raw, source, tract_paths) (#1079)
+            ng_tract.deposit_experience(content_bytes, "proto_unibrain", [self._latent_tract_path()])
         except Exception as exc:
-            logger.debug("River deposit failed: %s", exc)
+            if not self._deposit_warned:
+                logger.warning("River deposit failed (further failures at debug): %s", exc)
+                self._deposit_warned = True
+            else:
+                logger.debug("River deposit failed: %s", exc)
 
     # -----------------------------------------------------------------
     # Adapter pressure monitoring (Morphogenesis-inspired)
@@ -772,7 +798,8 @@ class ProtoUniBrainSocket(ElmerSocket):
 
     def _log_kick_event(self, sat_before: float) -> None:
         """Append CRISPR kick event to competence_delta.jsonl."""
-        os.makedirs(os.path.dirname(_DELTA_LOG_PATH), exist_ok=True)
+        delta_path = instance_file(_DELTA_LOG_DEFAULT, "competence_delta.jsonl")
+        os.makedirs(os.path.dirname(delta_path), exist_ok=True)
         try:
             from datetime import datetime
             import json
@@ -783,7 +810,7 @@ class ProtoUniBrainSocket(ElmerSocket):
                 "kick_number": self._adapter_kick_count + 1,
                 "sat_frac_before": round(sat_before, 4),
             }
-            with open(_DELTA_LOG_PATH, "a") as f:
+            with open(delta_path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
         except Exception as exc:
             logger.debug("CRISPR kick log failed: %s", exc)
@@ -960,124 +987,67 @@ class ProtoUniBrainSocket(ElmerSocket):
             logger.debug("ProtoUniBrain: weight stats log failed: %s", exc)
 
     def _read_river_delta(self):
-        """Read new substrate entries from the River (BTF tract).
+        """Read the River's new deposits from the Commons (the recency bucket).
 
-        Handles both entry types deposited by NeuroGraph:
-        - ENTRY_OUTCOME (type=1): 768-dim embedding → outcome_embeddings
-        - ENTRY_TOPOLOGY (type=2): msgpack compact topology delta → topology_delta dict
+        The River pools in the Commons: NeuroGraph deposits its fired-node topology, raw conversation
+        experience and outcomes there (medium-propagation, no addressed tracts), and so do the peers. This
+        bucket takes the deposits newer than the last read, oldest first, at most _RIVER_BUCKET_LIMIT, and
+        turns each into one 768-d embedding for the encoder's outcome path: the deposit's raw text embedded
+        here (LAW 7: interpretation at the bucket) when it carries text, else the deposit's own embedding.
 
-        Uses a cursor to read only entries deposited since last call.
-        Returns dict with keys 'topology' (dict|None) and 'outcomes' (List[np.ndarray]|None).
+        Returns {'topology': None, 'outcomes': List[np.ndarray]} or None when nothing new arrived (the
+        encoder's idle path).
 
         # ---- Changelog ----
-        # [2026-05-25] CC — Fix #251: handle ENTRY_TOPOLOGY entries (type=2) which NeuroGraph
-        #   now deposits after the River drain fix (#249 other CC). Topology entries carry
-        #   msgpack-encoded compact delta (fired_node_ids, synapses_pruned/sprouted,
-        #   predictions_confirmed/surprised). Normalized to encoder's dict format at this
-        #   boundary (LAW 7: extraction happens at consumption). Returns dict with both
-        #   'topology' and 'outcomes' keys so caller can pass each to encoder correctly.
-        # [2026-05-25] CC — Fix #249: magic bytes b"BT"→b"TB", ENTRY_OUTCOME filter,
-        #   cursor-based reading, logger.debug→logger.error.
+        # [2026-10-11] Claude Code (Opus 5.5, lane river-feed-fix) — read the Commons, not a dead tract
+        #   What: replaced the tracts/neurograph/proto_unibrain.tract + .cursor reader with a Commons
+        #         bucket_recent(since=watermark, with_embedding=True) read. Same name, same return shape.
+        #   Why:  no writer of tracts/neurograph/<peer>.tract exists since Commons Track 2 (NeuroGraph
+        #         neurograph_rpc._deposit_*_to_river -> commons.deposit); see the module changelog.
+        #   How:  the process's Commons via commons.get_commons() (the host decides which medium that is);
+        #         watermark = the newest recency timestamp read; failures log once per cycle at ERROR, as before.
+        # [2026-05-25] CC — Fix #251 / #249 (topology entries, BTF magic, cursor) — superseded by the above.
         # -------------------
         """
         try:
-            import json as _json
-            import msgpack as _msgpack
-            import ng_tract
-            tract_path = os.path.expanduser(
-                "~/.et_modules/tracts/neurograph/proto_unibrain.tract"
-            )
-            if not os.path.exists(tract_path):
+            from commons import get_commons
+            medium = get_commons()
+            rows = medium.bucket_recent(limit=_RIVER_BUCKET_LIMIT, since=self._river_since,
+                                        with_embedding=True)
+            if not rows:
                 return None
-
-            file_size = os.path.getsize(tract_path)
-            if file_size == 0:
-                return None
-
-            # Cursor tracks bytes already consumed — same JSON format as bridge cursors
-            cursor_path = os.path.expanduser(
-                "~/.et_modules/tracts/neurograph/proto_unibrain.cursor"
-            )
-            offset = 0
-            if os.path.exists(cursor_path):
-                try:
-                    with open(cursor_path) as _cf:
-                        _cd = _json.load(_cf)
-                    offset = int(_cd.get("offset", 0))
-                except Exception:
-                    offset = 0
-
-            if offset >= file_size:
-                return None  # nothing new
-
-            # Read bytes deposited since last cursor position
-            with open(tract_path, "rb") as f:
-                f.seek(offset)
-                data = f.read()
-
-            if not data:
-                return None
-
-            # If reading mid-file, scan forward to first valid BTF entry (magic: TB = 0x54, 0x42)
-            if offset > 0:
-                magic_pos = data.find(b"TB")
-                if magic_pos > 0:
-                    data = data[magic_pos:]
-
-            reader = ng_tract.TractReader(data)
             embeddings = []
-            last_topo_dict = None
-            topo_count = 0
-            outcome_count = 0
-
-            for entry in reader:
-                if not hasattr(entry, "entry_type"):
+            newest = self._river_since
+            embed = None
+            for row in reversed(rows):           # bucket_recent is newest first; the encoder wants oldest first
+                tid, _w, reasoning, meta, emb = row[:5]
+                try:
+                    ts = float(str(reasoning).rsplit("@", 1)[1])
+                except Exception:
+                    ts = self._river_since
+                newest = max(newest, ts)
+                text = ""
+                if isinstance(meta, dict):
+                    text = "\n\n".join(str(meta[k]) for k in ("text", "user_text", "assistant_text")
+                                         if meta.get(k))
+                vec = None
+                if text:
+                    if embed is None:
+                        from ng_embed import embed
+                    vec = embed(text)
+                elif emb is not None:
+                    vec = emb
+                if vec is None:
                     continue
-                if entry.entry_type == ng_tract.ENTRY_OUTCOME:
-                    if hasattr(entry, "embedding_as_numpy"):
-                        emb = entry.embedding_as_numpy()
-                        if emb is not None and len(emb) > 0:
-                            embeddings.append(emb)
-                            outcome_count += 1
-                elif entry.entry_type == ng_tract.ENTRY_TOPOLOGY:
-                    # Decode msgpack and normalize to encoder's dict format.
-                    # Topology entries carry compact delta: fired_node_ids, synapses_pruned/sprouted,
-                    # predictions_confirmed/surprised. Normalize at this boundary so the encoder's
-                    # existing dict path (_read_from_delta, _read_global) works unchanged.
-                    try:
-                        raw = entry.raw()
-                        raw_dict = _msgpack.unpackb(raw, raw=False)
-                        last_topo_dict = {
-                            "fired_nodes": [{"node_id": nid} for nid in raw_dict.get("fired_node_ids", [])],
-                            "fired_hyperedges": [{"he_id": hid} for hid in raw_dict.get("fired_hyperedge_ids", [])],
-                            "predictions": {
-                                "confirmed": raw_dict.get("predictions_confirmed", 0),
-                                "surprised": raw_dict.get("predictions_surprised", 0),
-                            },
-                            "structural": {
-                                "synapses_pruned": raw_dict.get("synapses_pruned", 0),
-                                "synapses_sprouted": raw_dict.get("synapses_sprouted", 0),
-                            },
-                            "timestep": raw_dict.get("timestep", 0),
-                            "salience": [],
-                        }
-                        topo_count += 1
-                    except Exception:
-                        pass
-
-            # Advance cursor to current file end
-            total = outcome_count + topo_count
-            try:
-                with open(cursor_path, "w") as _cf:
-                    _json.dump({"offset": file_size, "ts": time.time(), "entries": total}, _cf)
-            except Exception:
-                pass
-
-            result = {
-                "topology": last_topo_dict,
-                "outcomes": embeddings if embeddings else None,
-            }
-            return result if (last_topo_dict is not None or embeddings) else None
+                vec = np.asarray(vec, dtype=np.float32).reshape(-1)
+                if vec.size:
+                    embeddings.append(vec)
+            self._river_since = newest
+            if not embeddings:
+                return None
+            self._river_reads += 1
+            self._river_entries += len(embeddings)
+            return {"topology": None, "outcomes": embeddings}
 
         except Exception as exc:
             logger.error("River read failed: %s", exc)

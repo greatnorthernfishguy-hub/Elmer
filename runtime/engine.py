@@ -6,6 +6,12 @@ and the autonomic monitor.  Receives raw input, builds GraphSnapshots,
 routes through sockets, chains pipelines, and returns SocketOutputs.
 
 # ---- Changelog ----
+# [2026-10-11] Claude Code (Opus 5.5, lane river-feed-fix) — #1075 competence log follows ELMER_WORKSPACE_DIR
+# What: _log_competence_delta() writes $ELMER_WORKSPACE_DIR/competence_delta.jsonl when the variable is set,
+#       else ~/.elmer/competence_delta.jsonl as before (core.instance_paths.instance_file). The drain-loop comment
+#       now says the proto reads the River from the Commons.
+# Why: punch list #1075 (the CC's Elmer wrote a Syl-scoped log path); the proto's River moved to the Commons.
+# How: one call; no new variable.
 # [2026-09-11] Codex — #426 pass late Tonic providers to the existing BrainSwitcher.
 # What/Why: CC engine readiness can follow the delayed body load; discovery must retry.
 # How: forward provider registration, leaving model/resource policy with BrainSwitcher.
@@ -168,6 +174,7 @@ from core.myelination import MyelinationSocket
 from core.monitoring import MonitoringSocket
 from core.tuning import TuningSocket
 from core.socket_manager import SocketManager
+from core.instance_paths import instance_file
 try:
     from core.neural_comprehension import NeuralComprehensionSocket
     _NEURAL_AVAILABLE = True
@@ -750,8 +757,8 @@ class ElmerEngine:
                     _time.sleep(1.0)
                 else:
                     # No conversation — run brain sockets anyway.
-                    # ProtoUniBrain reads from the River (BTF tract) directly.
-                    # The River always has fresh topology from the Tonic.
+                    # ProtoUniBrain buckets the River from the Commons directly
+                    # (_read_river_delta); an empty River = the encoder's idle path.
                     try:
                         from core.base_socket import GraphSnapshot
                         autonomic = _commons_arousal()  # #328 Step 2: arousal from the Commons
@@ -913,7 +920,7 @@ class ElmerEngine:
             import json, os, math
             from datetime import datetime
 
-            delta_path = os.path.expanduser("~/.elmer/competence_delta.jsonl")
+            delta_path = instance_file("~/.elmer/competence_delta.jsonl", "competence_delta.jsonl")
             os.makedirs(os.path.dirname(delta_path), exist_ok=True)
 
             proto_sig = proto_output.signal
