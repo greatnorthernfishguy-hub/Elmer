@@ -9,6 +9,16 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-10-12] Claude Code (Opus 5.5, lane f1-idle-silence; Josh 2026-10-12 "E1 for now") — idle cycles are silence
+#   What: process() opens the engine's capture_context(traffic=<the River delivered input this cycle>). On an idle
+#         cycle (_read_river_delta() returned None, so the encoder emits its idle filler sequence) the forward is
+#         captured with traffic=False: Flow-Lenia F1 counts it as silence (usage EMA relaxes toward usage0, rho -> 1),
+#         while its sketch and residual check still see the forward as before.
+#   Why:  design 2026-10-11-proto-flow-lenia-design.md §4.4 ("With no traffic, rho relaxes toward 1 ... wake
+#         silence"); drift analysis 2026-10-12 C8 / E1. Only the host knows whether the River delivered anything;
+#         the engine (UniAI lenia/engine.py) decides what silence does (LAW 4).
+#   How:  one keyword on the existing call; an engine without the keyword (TypeError) gets the old call, so every
+#         own forward counts as before. Nothing else in process() changes (zero-bleed gate unchanged).
 # [2026-10-11] Claude Code (Opus 5.5, lane river-feed-fix) — the River reaches the proto: bucket the Commons
 #   What: (1) _read_river_delta() (same name, same return shape, LAW 3 restore in place) buckets the process's
 #             Commons — get_commons().bucket_recent(since=<watermark>, with_embedding=True) — instead of reading
@@ -501,7 +511,15 @@ class ProtoUniBrainSocket(ElmerSocket):
             _body_ctx = self._body_lock if self._body_lock is not None else contextlib.nullcontext()
 
             _capture = getattr(self._lenia, "capture_context", None)
-            _capture_ctx = _capture() if _capture is not None else contextlib.nullcontext()
+            # E1 (2026-10-12): no River input this cycle = the encoder's idle filler = silence for the flow (§4.4)
+            _river_input = latest_delta is not None
+            if _capture is None:
+                _capture_ctx = contextlib.nullcontext()
+            else:
+                try:
+                    _capture_ctx = _capture(traffic=_river_input)
+                except TypeError:            # engine.py without the traffic flag: every own forward counts
+                    _capture_ctx = _capture()
             _flow_f1 = bool(getattr(self._lenia, "flow_f1_active", False))
 
             with _body_ctx:
