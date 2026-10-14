@@ -92,16 +92,20 @@ class GraphEncoder:
             timestamp=signal.timestamp,
         )
 
-    def encode(self, signal: SubstrateSignal) -> Dict[str, Any]:
+    def encode(self, signal: SubstrateSignal, text: Optional[str] = None) -> Dict[str, Any]:
         """Encode a signal for NG ecosystem recording.
 
         Args:
             signal: SubstrateSignal to encode.
+            text: [2026-10-14 #1113] the raw input content. When given, THIS is embedded (so Elmer's
+                  NG-Lite -- and its Cricket rim check -- see what the input says). The signal's
+                  description ("Inference on: Sensory input: N chars") is only a fallback for callers
+                  without content.
 
         Returns:
             Dict with 'embedding', 'target_id', and 'metadata'.
         """
-        text = signal.description
+        text = text if (text is not None and text.strip()) else signal.description
         embedding = self._embed(text)
         target_id = f"{signal.signal_type}:{signal.module_id}"
 

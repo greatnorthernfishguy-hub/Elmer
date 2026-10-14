@@ -6,6 +6,8 @@ and the autonomic monitor.  Receives raw input, builds GraphSnapshots,
 routes through sockets, chains pipelines, and returns SocketOutputs.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Opus 5.5 (Executive, Josh "I'd like what Elmer embeds to be usable by Elmer") — #1113: the NG
+#   ecosystem recording embeds the raw input text, not "Inference on: Sensory input: N chars"; the Cricket rim can now fire on content.
 # [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1107: the Cricket check reads the forest result; loud rim load
 # What: (1) step 7 read `outcome.get("constitutional")` on dual_record_outcome's return, whose documented schema puts
 #       the NG-Lite result under "forest_result" — so a rim catch was never reported (no WARNING, no violation
@@ -565,7 +567,7 @@ class ElmerEngine:
         eco_result = None
         if self._ecosystem:
             try:
-                encoding = self._graph_encoder.encode(final_signal)
+                encoding = self._graph_encoder.encode(final_signal, text=text)  # #1113: embed the content, not its description
                 if encoding and "embedding" in encoding:
                     embedding = encoding["embedding"]
                     outcome = self._ecosystem.dual_record_outcome(
