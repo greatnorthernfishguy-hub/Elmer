@@ -9,6 +9,13 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves) — a failed restore keeps the files instead of saving over them
+#   What: when _restore_evolved_weights() fails, proto_weights.pt and proto_lenia_state.pt are renamed to
+#         <name>.unloadable-<stamp> (os.replace, no copy) and the failure is an ERROR naming them.
+#   Why:  #1095: after the torn load the proto started fresh and its next periodic save wrote over the old file.
+#         Atomic saves stop the tear; this stops any other restore failure (a load_flow_state validation error, an
+#         interrupted read, a future format change) from turning into silent loss of the evolved state.
+#   How:  only the except path changes; a missing file is still the normal "starting fresh" INFO.
 # [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves; Josh 2026-10-14 "anything that can't risk a failed save, be atomic")
 #   What: save_evolved_weights() writes proto_weights.pt and proto_lenia_state.pt through core.atomic_io.torch_save_atomic
 #         (temp file in ~/.elmer -> torch.save -> fsync -> os.replace -> fsync dir) instead of torch.save in place.
@@ -943,7 +950,18 @@ class ProtoUniBrainSocket(ElmerSocket):
 
             return True
         except Exception as exc:
-            logger.warning("ProtoUniBrain: weight restore failed (%s) — starting fresh", exc)
+            # Keep the unloadable files: the next periodic save would otherwise write over them (#1095).
+            _stamp = time.strftime("%Y%m%dT%H%M%S")
+            _kept = []
+            for _p in (_PROTO_WEIGHTS_PATH, _PROTO_LENIA_STATE_PATH):
+                if os.path.exists(_p):
+                    try:
+                        os.replace(_p, f"{_p}.unloadable-{_stamp}")
+                        _kept.append(os.path.basename(_p))
+                    except OSError as _exc:
+                        logger.error("ProtoUniBrain: could not set %s aside (%s)", _p, _exc)
+            logger.error("ProtoUniBrain: weight restore failed (%s) — starting fresh; kept %s as *.unloadable-%s "
+                         "beside them for recovery", exc, ", ".join(_kept) or "nothing", _stamp)
             return False
 
     def save_evolved_weights(self) -> None:

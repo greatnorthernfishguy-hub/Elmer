@@ -178,3 +178,21 @@ def test_sigkill_during_proto_save_never_tears(tmp_path):
 def test_control_inplace_save_tears_under_same_kills(tmp_path):
     res = _run_kills(tmp_path, "inplace", kills=25, seed=1095)
     assert any(ok is False for ok, _ in res), res            # the harness does see torn files
+
+
+def test_failed_restore_sets_files_aside(tmp_path, monkeypatch):
+    import core.proto_brain_socket as pbs
+    w = tmp_path / "proto_weights.pt"
+    ls = tmp_path / "proto_lenia_state.pt"
+    w.write_bytes(b"PK\x03\x04 torn")                    # unloadable
+    torch.save({"step_count": 1}, str(ls))
+    monkeypatch.setattr(pbs, "_torch", torch)
+    monkeypatch.setattr(pbs, "_PROTO_WEIGHTS_PATH", str(w))
+    monkeypatch.setattr(pbs, "_PROTO_LENIA_STATE_PATH", str(ls))
+    s = pbs.ProtoUniBrainSocket.__new__(pbs.ProtoUniBrainSocket)
+    s._brain = _Brain(); s._lenia = _Lenia()
+    assert s._restore_evolved_weights() is False
+    names = sorted(os.listdir(tmp_path))
+    assert not w.exists() and not ls.exists()
+    assert any(n.startswith("proto_weights.pt.unloadable-") for n in names), names
+    assert any(n.startswith("proto_lenia_state.pt.unloadable-") for n in names), names
