@@ -10,6 +10,10 @@ The result is a model that reads graph state and outputs SubstrateSignal
 fields, with transformer-class reasoning in between.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1108: identity width = graph_io.IDENTITY_DIM (768)
+#   What: the smoke-test identity is IDENTITY_DIM wide.
+#   Why:  #1108: the encoder takes the identity vector at the embedding model's width (768); nothing pads/truncates.
+#   How:  IDENTITY_DIM from graph_io.
 # [2026-03-20] Claude Code (Opus 4.6) — Initial surgery implementation
 #   What: Load Qwen2.5-0.5B, replace embed_tokens and lm_head with
 #         graph-native I/O layers, verify forward pass works.
@@ -27,6 +31,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoConfig
 from graph_io import (
+    IDENTITY_DIM,
     GraphStateEncoder,
     GraphSignalDecoder,
     GraphFeatures,
@@ -106,8 +111,8 @@ def create_synthetic_features(device='cpu') -> GraphFeatures:
         recent_firings=torch.randint(0, 50, (15,), device=device).float(),
         stdp_delta_mean=torch.tensor([0.002], device=device),
 
-        # Identity embedding (384-dim, ecosystem standard)
-        identity_embedding=torch.randn(384, device=device) * 0.1,
+        # Identity embedding (IDENTITY_DIM = the embedding model's width, #1108)
+        identity_embedding=torch.randn(IDENTITY_DIM, device=device) * 0.1,
     )
 
 

@@ -6,6 +6,15 @@ GraphSnapshot format consumed by sockets.  Also produces NG-compatible
 embedding dicts for ecosystem recording.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1110: _embed fails loud
+#   What: _embed no longer returns np.zeros(768) when ng_embed fails: the failure (ng_embed's
+#         EmbeddingUnavailableError, an import error, anything) propagates, logged at ERROR. encode() therefore
+#         raises, and engine.process_text's existing `except` around step 7 logs "NG ecosystem recording failed"
+#         and records nothing for that input.
+#   Why:  #1110 / DIM_GUARD.md §2.2: a failed embed was recorded as the all-zero vector — one hash node collecting every
+#         failure (and, with mean-centring, the zero vector would sit at -centre and compare as a real input). ng_embed
+#         itself is fail-closed by design ("no hash fallback"); a consumer-side zero fallback undid that (LAW 4).
+#   How:  try/except removed around the call; an ERROR log naming the cause before re-raising.
 # [2026-02-28] Claude (Opus 4.6) — §5.2.2/§6.1/§9 compliant rewrite.
 #   What: GraphEncoder with signal_to_snapshot(), encode(), and
 #         hash-based embedding for testing.
@@ -112,10 +121,11 @@ class GraphEncoder:
         """Embed via ng_embed (ecosystem standard).
 
         Snowflake/snowflake-arctic-embed-m-v1.5, 768-dim, ONNX.
-        Falls back to zero vector if embedding fails.
+        Fails loud (#1110): a failed embed raises (ng_embed is fail-closed); nothing is recorded for that input.
         """
         try:
             from ng_embed import embed
             return embed(text, normalize=True)
-        except Exception:
-            return np.zeros(self._embedding_dim, dtype=np.float32)
+        except Exception as exc:
+            logger.error("GraphEncoder: embedding failed (%s: %s) — this input is not recorded", type(exc).__name__, exc)
+            raise

@@ -6,6 +6,17 @@ and the autonomic monitor.  Receives raw input, builds GraphSnapshots,
 routes through sockets, chains pipelines, and returns SocketOutputs.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1107: the Cricket check reads the forest result; loud rim load
+# What: (1) step 7 read `outcome.get("constitutional")` on dual_record_outcome's return, whose documented schema puts
+#       the NG-Lite result under "forest_result" — so a rim catch was never reported (no WARNING, no violation
+#       deposit). It now reads outcome["forest_result"]["constitutional"] (the forest = the whole input; tree-level
+#       catches still freeze learning inside NG-Lite but deposit nothing, as the deposit carries the forest embedding).
+#       (2) _load_constitutional_embeddings logs a missing / unreadable rim file at ERROR (was INFO / WARNING
+#       "degrades gracefully") and a rim file whose declared model is not ng_embed.MODEL_NAME at ERROR (NG-Lite then
+#       refuses its vectors loudly). (3) the brain-buffer identity default is ng_embed's dimension, not 384.
+# Why: Josh 2026-10-14: "Running without the Rim defeats the entire point of the Rim's existence. It's supposed to be
+#      immutable." A rim that is absent, or present but never reported, must be loud. #1108 (no 384 identity).
+# How: three local edits; no new state.
 # [2026-10-11] Claude Code (Opus 5.5, lane river-feed-fix) — #1075 competence log follows ELMER_WORKSPACE_DIR
 # What: _log_competence_delta() writes $ELMER_WORKSPACE_DIR/competence_delta.jsonl when the variable is set,
 #       else ~/.elmer/competence_delta.jsonl as before (core.instance_paths.instance_file). The drain-loop comment
@@ -204,6 +215,12 @@ from runtime.graph_encoder import GraphEncoder
 from runtime.signal_decoder import SignalDecoder
 
 logger = logging.getLogger("elmer.engine")
+
+
+def _identity_dim() -> int:
+    """The identity vector's dimension = the active embedding model's (ng_embed.EMBEDDING_DIM, 768) — #1108."""
+    import ng_embed
+    return int(ng_embed.EMBEDDING_DIM)
 
 
 def _commons_arousal(default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -562,11 +579,14 @@ class ElmerEngine:
                     # Cricket rim: if record_outcome hit a constitutional node,
                     # escalate to SYMPATHETIC. This is the sole exception to
                     # Elmer's read-only autonomic rule (CLAUDE.md §2).
-                    if outcome.get("constitutional"):
+                    # #1107: dual_record_outcome returns {"forest_result": <NG-Lite result>, ...}; the rim flag is on
+                    # the forest's result (the old top-level read never fired).
+                    forest_result = (outcome or {}).get("forest_result") or {}
+                    if forest_result.get("constitutional"):
                         logger.warning(
                             "Cricket rim activated — constitutional node %s — "
                             "depositing violation to the Commons (Immunis decides arousal)",
-                            outcome.get("node_id"),
+                            forest_result.get("node_id"),
                         )
                         # [2026-06-22] #328 Step 3 (B): Cricket-rim is a DEPOSITOR, not an arousal
                         # writer. Deposit the raw constitutional-violation event to the Commons;
@@ -581,9 +601,9 @@ class ElmerEngine:
                             if _c is not None:
                                 _c.deposit(
                                     embedding,
-                                    f"violation:constitutional:{outcome.get('node_id')}",
+                                    f"violation:constitutional:{forest_result.get('node_id')}",
                                     metadata={"kind": "violation", "violation": "constitutional",
-                                              "node_id": outcome.get("node_id"),
+                                              "node_id": forest_result.get("node_id"),
                                               "source": "cricket_rim", "ts": time.time()},
                                 )
                         except Exception as exc:  # noqa: BLE001 — deposit failure never breaks the engine
@@ -829,7 +849,7 @@ class ElmerEngine:
             else:
                 temporal_feat = [0.0, 0.0, 0.0, 0.0]
 
-            identity = meta.get('identity_embedding', _np.zeros(384))
+            identity = meta.get('identity_embedding', _np.zeros(_identity_dim()))  # #1108: ng_embed's dim
 
             features = {
                 'node_features': node_feat,
@@ -1051,8 +1071,9 @@ class ElmerEngine:
         """Load constitutional embeddings from data/constitutional_embeddings.json.
 
         Returns the embeddings list for passing to NGLite via config.
-        Returns empty list if file not found (module runs without rim —
-        constitutional enforcement degrades gracefully).
+        A missing or unreadable rim is an ERROR (#1107, Josh 2026-10-14: the rim is immutable; running without it
+        defeats its purpose) — the engine still starts, but loudly rim-less. A rim declared for another model is
+        logged at ERROR here and refused by NG-Lite (dimension / embedding-space guard).
         """
         paths = [
             os.path.join(os.path.dirname(os.path.dirname(__file__)),
@@ -1063,8 +1084,19 @@ class ElmerEngine:
                 try:
                     with open(path) as f:
                         data = json.load(f)
+                    try:
+                        import ng_embed
+                        want = getattr(ng_embed, "MODEL_NAME", None)
+                    except Exception:  # noqa: BLE001 — NG-Lite's own guard still checks the vectors
+                        want = None
+                    if want is not None and data.get("model") != want:
+                        logger.error(
+                            "Cricket rim file %s declares model %r but the active embedding model is %r — NG-Lite "
+                            "will refuse it; rebuild it from its descriptions (NeuroGraph dim_reembed.py rim)",
+                            path, data.get("model"), want)
                     return data.get("embeddings", [])
                 except Exception as exc:
-                    logger.warning("Failed to load constitutional embeddings from %s: %s", path, exc)
-        logger.info("No constitutional embeddings found — Cricket rim inactive")
+                    logger.error("Cricket rim: failed to load constitutional embeddings from %s: %s — RIM ABSENT",
+                                 path, exc)
+        logger.error("Cricket rim: no constitutional embeddings found (%s) — RIM ABSENT", paths)
         return []

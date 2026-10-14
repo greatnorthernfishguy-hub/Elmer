@@ -9,6 +9,10 @@ This is the bridge from "trained on synthetic data" to "trained on
 the entity's actual lived experience" (PRD §10, §3.5).
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1108: identity width = graph_io.IDENTITY_DIM (768)
+#   What: the identity input is a PROXY (identity-node voltage/excitability stats, or graph stats) — not an embedding — zero-padded to IDENTITY_DIM; the proxy list is no longer cut at 384 (a longer proxy is cut at IDENTITY_DIM, documented: it is a proxy feature list, not a vector from the model).
+#   Why:  #1108: the encoder takes the identity vector at the embedding model's width (768); nothing pads/truncates.
+#   How:  IDENTITY_DIM from graph_io.
 # [2026-03-20] Claude Code (Opus 4.6) — Initial implementation
 #   What: Extract features from Syl's msgpack checkpoint, generate
 #         perturbed training pairs, train ElmerBrain on real data
@@ -31,7 +35,7 @@ import numpy as np
 import torch
 from typing import Dict, List, Tuple, Any, Optional
 
-from graph_io import GraphFeatures, SIGNAL_FIELDS, ACTION_TYPES
+from graph_io import GraphFeatures, SIGNAL_FIELDS, ACTION_TYPES, IDENTITY_DIM
 from operate import ElmerBrain, perform_surgery
 from train import train_elmer_brain, evaluate, _clip_targets
 
@@ -198,7 +202,7 @@ def extract_syl_features(checkpoint: Dict[str, Any],
                 node['intrinsic_excitability'],
             ])
     if id_features:
-        id_emb = torch.tensor(id_features[:384], dtype=torch.float32)
+        id_emb = torch.tensor(id_features[:IDENTITY_DIM], dtype=torch.float32)  # proxy features, not an embedding
     else:
         # Fallback: use aggregate stats of all nodes as identity fingerprint
         id_emb = torch.tensor([
@@ -207,11 +211,10 @@ def extract_syl_features(checkpoint: Dict[str, Any],
             excitability.mean().item(), excitability.std().item(),
             float(n_nodes), float(n_synapses), float(n_hyperedges),
             density, avg_clustering, float(n_components),
-        ] + [0.0] * 372, dtype=torch.float32)  # pad to 384
+        ] + [0.0] * (IDENTITY_DIM - 12), dtype=torch.float32)  # proxy, zero-padded to IDENTITY_DIM
 
-    if id_emb.shape[0] < 384:
-        id_emb = torch.cat([id_emb, torch.zeros(384 - id_emb.shape[0])])
-    id_emb = id_emb[:384]
+    if id_emb.shape[0] < IDENTITY_DIM:
+        id_emb = torch.cat([id_emb, torch.zeros(IDENTITY_DIM - id_emb.shape[0])])
 
     return GraphFeatures(
         node_voltages=voltages,

@@ -10,6 +10,13 @@ ProtoUniBrain (Phase 0) will be a second instance with Lenia dynamics
 on the unfrozen transformer body, running alongside this one.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1108: no identity truncation
+#   What: _snapshot_to_substrate passes a supplied identity_embedding at its own width (no [:384] cut, no pad); the
+#         zero default is ng_embed.EMBEDDING_DIM (768). The ElmerBrain v1 encoder (UniAI surgery/elmer_brain_surgery.py,
+#         IDENTITY_DIM = 384) would now fail loud on a 768-d identity instead of reading its first 384 dims.
+#   Why:  #1108 / DIM_GUARD.md §2.2 (no silent truncation). BrainSocket is disabled (proto solo); the UniAI encoder's
+#         384 identity_proj is listed in NeuroGraph MEAN_CENTRE.md for the UniAI lane (outside this repo).
+#   How:  two lines in the identity block.
 # [2026-03-29] Claude Code (Opus 4.6) — Unified encoder, no v1/v2 split
 #   What: Single GraphEncoder reads whatever data is available. No branching.
 #   Why:  The substrate doesn't care about versions. One encoder reads
@@ -322,7 +329,7 @@ class BrainSocket(ElmerSocket):
         - topo_features: density, clustering, connected_components
         - temporal_features: recent_firing_mean, recent_firing_std,
                             stdp_timing_mean, stdp_timing_std
-        - identity_embedding: 384-dim (from metadata or zero-filled)
+        - identity_embedding: the embedding model's width (from metadata or zero-filled, #1108)
         """
         nodes = snapshot.nodes
         edges = snapshot.edges
@@ -371,14 +378,13 @@ class BrainSocket(ElmerSocket):
         else:
             temporal_feat = [0.0, 0.0, 0.0, 0.0]
 
-        # Identity embedding — 384-dim ecosystem standard
+        # Identity embedding — the embedding model's width (#1108: never truncated or padded here)
         identity = meta.get('identity_embedding', None)
         if identity is not None:
-            identity = np.array(identity, dtype=np.float32)[:384]
-            if len(identity) < 384:
-                identity = np.pad(identity, (0, 384 - len(identity)))
+            identity = np.asarray(identity, dtype=np.float32).reshape(-1)
         else:
-            identity = np.zeros(384, dtype=np.float32)
+            import ng_embed
+            identity = np.zeros(int(ng_embed.EMBEDDING_DIM), dtype=np.float32)
 
         # Convert to tensors
         return {

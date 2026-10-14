@@ -9,6 +9,11 @@ Brain is wired externally by BrainSwitcher after ProtoUniBrain loads — this
 socket never self-loads any model. Falls back to heuristics until brain arrives.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1108: identity at graph_io.IDENTITY_DIM
+#   What: the identity vector from snapshot metadata is taken at its full width (graph_io.IDENTITY_DIM = 768; the
+#         encoder raises on any other length) instead of being cut / padded to 384; the zero default is IDENTITY_DIM.
+#   Why:  #1108 (no silent truncation of the 768-d identity).
+#   How:  identity block of _snapshot_to_features.
 # [2026-04-19] Claude Code (Sonnet 4.6) — Fix _neural_process brain call + signal unpacking
 #   What: Removed GraphFeatures conversion; call self._brain(snapshot=snapshot) directly.
 #         Unpack signals tensor via signal_names; fix key names (coherence not coherence_score).
@@ -249,7 +254,7 @@ class NeuralComprehensionSocket(ElmerSocket):
 
     def _snapshot_to_features(self, snapshot: GraphSnapshot) -> 'GraphFeatures':
         """Convert a GraphSnapshot into GraphFeatures for the encoder."""
-        from graph_io import GraphFeatures
+        from graph_io import GraphFeatures, IDENTITY_DIM
 
         nodes = snapshot.nodes
         edges = snapshot.edges
@@ -291,13 +296,11 @@ class NeuralComprehensionSocket(ElmerSocket):
 
         # Identity embedding from metadata if available
         meta = snapshot.metadata
-        id_emb = torch.zeros(384)
+        id_emb = torch.zeros(IDENTITY_DIM)
         if 'identity_embedding' in meta:
             raw = meta['identity_embedding']
             if isinstance(raw, (list, tuple)):
-                id_emb = torch.tensor(raw[:384], dtype=torch.float32)
-                if len(id_emb) < 384:
-                    id_emb = torch.cat([id_emb, torch.zeros(384 - len(id_emb))])
+                id_emb = torch.tensor(list(raw), dtype=torch.float32)  # full width; the encoder checks it (#1108)
 
         return GraphFeatures(
             node_voltages=voltages,
