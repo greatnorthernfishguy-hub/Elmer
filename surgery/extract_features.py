@@ -9,6 +9,13 @@ the tensor format that GraphStateEncoder expects.
 #   What: Extract real graph state from NG-Lite into GraphFeatures tensors
 #   Why:  Training data pipeline for ElmerBrain I/O layers
 #   How:  Read nodes, synapses, compute topology metrics, pack into tensors
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: read NG-Lite through its public methods
+#   What: list_nodes() / list_synapses() / get_history() / get_stats()["total_outcomes"] instead of
+#         ng_lite.nodes / .synapses / ._history / ._total_outcomes; the clustering membership test uses a key set
+#         built from the same synapse snapshot.
+#   Why:  Josh 2026-10-13 (#1096): consumers stop reading NGLite internals so the Rust NGLiteCore can hold the
+#         state (on it, .nodes / .synapses raise). Same features on the Python core.
+#   How:  one snapshot per call; nothing else changes.
 # -------------------
 """
 
@@ -35,8 +42,9 @@ def extract_features_from_ng_lite(ng_lite, identity_embedding: Optional[np.ndarr
     Returns:
         GraphFeatures ready for the GraphStateEncoder.
     """
-    nodes = list(ng_lite.nodes.values())
-    synapses = list(ng_lite.synapses.values())
+    nodes = ng_lite.list_nodes()
+    synapses = ng_lite.list_synapses()
+    syn_keys = {(s.source_id, s.target_id) for s in synapses}
 
     now = time.time()
 
@@ -107,7 +115,7 @@ def extract_features_from_ng_lite(ng_lite, identity_embedding: Optional[np.ndarr
             for j in range(i + 1, len(neighbor_list)):
                 key1 = (neighbor_list[i], neighbor_list[j])
                 key2 = (neighbor_list[j], neighbor_list[i])
-                if key1 in ng_lite.synapses or key2 in ng_lite.synapses:
+                if key1 in syn_keys or key2 in syn_keys:
                     neighbor_edges += 1
         possible = len(neighbors) * (len(neighbors) - 1) / 2
         clustering_coeffs.append(neighbor_edges / possible if possible > 0 else 0.0)
@@ -139,7 +147,7 @@ def extract_features_from_ng_lite(ng_lite, identity_embedding: Optional[np.ndarr
     # ---- Temporal features ----
     # Recent firings: count activations in the last N steps
     # NG-Lite tracks _history as a list of dicts
-    history = getattr(ng_lite, '_history', [])
+    history = ng_lite.get_history()
     window_size = 15
     recent_firings = torch.zeros(window_size)
     if history:
@@ -204,8 +212,8 @@ def extract_training_targets(ng_lite, features: GraphFeatures) -> Dict[str, floa
     These come from the SAME heuristics that the current stub sockets use,
     so the trained model learns to replicate (and eventually surpass) them.
     """
-    nodes = list(ng_lite.nodes.values())
-    synapses = list(ng_lite.synapses.values())
+    nodes = ng_lite.list_nodes(with_embedding=False)
+    synapses = ng_lite.list_synapses(with_metadata=False)
     n_nodes = len(nodes)
     n_synapses = len(synapses)
 
@@ -240,7 +248,7 @@ def extract_training_targets(ng_lite, features: GraphFeatures) -> Dict[str, floa
     novelty = 1.0 / (1.0 + n_nodes * 0.01)
 
     # Confidence: based on amount of data
-    total_outcomes = getattr(ng_lite, '_total_outcomes', 0)
+    total_outcomes = ng_lite.get_stats()["total_outcomes"]
     confidence = min(total_outcomes / 100.0, 1.0)  # saturates at 100 outcomes
 
     # Severity: from health thresholds (PRD §14)
