@@ -59,7 +59,9 @@ def test_complete_write_replaces_and_keeps_mode(tmp_path):
     assert stat.S_IMODE(os.stat(p).st_mode) == 0o640
 
 
-def test_stale_temps_reported_not_deleted(tmp_path):
+def test_stale_temps_of_dead_writers_clear_themselves(tmp_path):
+    """Josh 2026-10-15: temps of dead writers are removed (the next write clears them); a live writer's temp,
+    another target's temp, and the real file are never touched."""
     p = tmp_path / "state.pt"
     atomic_io.atomic_write_bytes(str(p), b"x")
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
@@ -68,10 +70,14 @@ def test_stale_temps_reported_not_deleted(tmp_path):
     stale.write_bytes(b"torn")
     live = tmp_path / f"state.pt.tmp-{os.getpid()}-cafecafe"
     live.write_bytes(b"mine")
-    found = atomic_io.find_stale_temps(str(p))
-    assert found == [str(stale)]
-    atomic_io.warn_stale_temps(str(p))
-    assert stale.exists() and live.exists()
+    other = tmp_path / f"other.pt.tmp-{dead.pid}-deadbeef"
+    other.write_bytes(b"not this target")
+    assert atomic_io.find_stale_temps(str(p)) == [str(stale)]
+    atomic_io.atomic_write_bytes(str(p), b"y")          # the next save clears this target's dead-writer temps
+    assert not stale.exists()
+    assert live.exists() and other.exists()
+    assert p.read_bytes() == b"y"
+    assert atomic_io.clear_stale_temps(str(p)) == []   # nothing left; never raises
 
 
 class _Brain:

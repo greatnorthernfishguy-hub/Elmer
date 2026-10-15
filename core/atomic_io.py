@@ -8,10 +8,19 @@ file or the new complete file, never a mix. The final file's bytes and format ar
 have produced in place (torch.save / json / msgpack unchanged), so readers need no change.
 
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5) — temps of dead writers clear themselves
+#   What: warn_stale_temps -> clear_stale_temps: this target's temp files left by DEAD writers are DELETED (one
+#         WARNING naming them), and atomic_write calls it on every write (was: only torch_save_atomic, log only).
+#   Why:  Josh 2026-10-15: "Temp files are temporary, so if they are no longer needed, I'm not aware of any reason to
+#         keep them around" / "Temp files clearing themselves once done sounds nice." A killed proto save leaves a
+#         ~1.44 GB temp each time.
+#   How:  same match as before (this basename + ".tmp-<pid>-", writer pid dead and not ours); only the process named
+#         in a temp's name ever writes it, so a dead pid means nobody will. A pid now reused by a live process is
+#         left alone (conservative). Never raises.
 # [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves) — initial helper
 #   What: atomic_write(path, write_fn) (write_fn writes the whole file at the temp path it is given),
 #         atomic_write_bytes / atomic_write_text, torch_save_atomic(obj, path), and find_stale_temps / warn_stale_temps(path)
-#         (LOGS, never deletes, this target's temp files left by DEAD processes, e.g. a SIGKILL mid-save).
+#         (2026-10-14: logged, did not delete; this target's temp files left by DEAD processes, e.g. a SIGKILL mid-save).
 #   Why:  Josh 2026-10-14: "We should have all saves and checkpoints, anything that can't risk a failed save, be
 #         atomic." A daemon restart caught save_evolved_weights() mid-torch.save of ~/.elmer/proto_weights.pt
 #         (non-atomic, punch list #1095); the torn file could not load, the proto restarted from the pretrained
@@ -85,8 +94,7 @@ def find_stale_temps(path: str) -> list:
     """Temp files of THIS target left by DEAD processes (a write killed mid-way), as full paths. Never raises.
 
     Only names "<basename>.tmp-<pid>-..." in the target's directory are considered; a temp whose pid is this
-    process or any live process is not stale. Nothing is deleted here (deleting files is Josh's call): the
-    writer logs them so a leak is visible.
+    process or any live process is not stale. clear_stale_temps deletes what this returns.
     """
     directory = os.path.dirname(os.path.abspath(path))
     base = os.path.basename(path)
@@ -107,18 +115,23 @@ def find_stale_temps(path: str) -> list:
     return stale
 
 
-def warn_stale_temps(path: str) -> None:
-    stale = find_stale_temps(path)
-    if stale:
-        total = 0
-        for p in stale:
-            try:
-                total += os.path.getsize(p)
-            except OSError:
-                pass
-        logger.warning("atomic_io: %d stale temp file(s) of %s from dead writers (%.0f MB): %s -- an interrupted "
-                       "save left them; the real file is intact. Safe to delete.", len(stale),
-                       os.path.basename(path), total / 1e6, ", ".join(os.path.basename(p) for p in stale))
+def clear_stale_temps(path: str) -> list:
+    """Delete this target's temp files left by dead writers (interrupted saves). Returns the removed paths. Never raises."""
+    removed, total = [], 0
+    for p in find_stale_temps(path):
+        try:
+            size = os.path.getsize(p)
+            os.remove(p)
+        except OSError as exc:
+            logger.debug("atomic_io: could not remove stale temp %s (%s)", p, exc)
+            continue
+        removed.append(p)
+        total += size
+    if removed:
+        logger.warning("atomic_io: removed %d stale temp file(s) of %s left by interrupted saves (%.0f MB): %s -- "
+                       "the real file was intact.", len(removed), os.path.basename(path), total / 1e6,
+                       ", ".join(os.path.basename(p) for p in removed))
+    return removed
 
 
 def atomic_write(path: str, write_fn: Callable[[str], Any], *, suffix: str = "") -> Any:
@@ -131,6 +144,7 @@ def atomic_write(path: str, write_fn: Callable[[str], Any], *, suffix: str = "")
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
     mode = _target_mode(path)
+    clear_stale_temps(path)
     tmp = os.path.join(directory, f"{os.path.basename(path)}{_TMP_MARK}{os.getpid()}-{uuid.uuid4().hex[:8]}{suffix}")
     try:
         result = write_fn(tmp)
@@ -163,5 +177,4 @@ def torch_save_atomic(obj: Any, path: str, torch_module: Optional[Any] = None) -
     """torch.save(obj, path), atomically. Same bytes as an in-place torch.save; torch.load reads it unchanged."""
     if torch_module is None:
         import torch as torch_module  # noqa: PLC0415 (lazy: Elmer imports torch lazily)
-    warn_stale_temps(path)
     atomic_write(path, lambda tmp: torch_module.save(obj, tmp))
