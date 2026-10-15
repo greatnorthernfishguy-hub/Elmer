@@ -15,6 +15,11 @@ Decision factors:
   - Autonomic state (SYMPATHETIC = stay light, PARASYMPATHETIC = go heavy)
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves) — proto_body_status.json written atomically
+#   What: _write_proto_body_status() writes through core.atomic_io.atomic_write_text (temp + fsync + os.replace).
+#   Why:  Josh 2026-10-14 "anything that can't risk a failed save, be atomic": an interrupted open('w') + json.dump
+#         left an empty / half status file that a Tonic consumer would read as unparseable.
+#   How:  same path, same JSON content; removal on shed unchanged.
 # [2026-10-11] Claude Code (Opus 5.5, lane river-feed-fix) — #1075 instance-scoped body lock + status file
 # What: proto_body.lock and proto_body_status.json resolve through core.instance_paths.instance_file: under
 #       $ELMER_WORKSPACE_DIR when it is set, else ~/.et_modules/elmer/ exactly as before.
@@ -253,12 +258,12 @@ class BrainSwitcher:
                 import json as _json
                 os.makedirs(os.path.dirname(status_path), exist_ok=True)
                 self._prepare_body_lock_file()
-                with open(status_path, 'w') as _f:
-                    _json.dump({
-                        "available": True,
-                        "lock": lock_path,
-                        "loaded_at": time.time(),
-                    }, _f)
+                from core.atomic_io import atomic_write_text
+                atomic_write_text(status_path, _json.dumps({   # atomic: a reader never sees half a status file
+                    "available": True,
+                    "lock": lock_path,
+                    "loaded_at": time.time(),
+                }))
             else:
                 if os.path.exists(status_path):
                     os.remove(status_path)

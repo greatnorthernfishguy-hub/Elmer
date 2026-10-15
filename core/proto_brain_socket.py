@@ -9,6 +9,21 @@ Runs alongside the frozen BrainSocket. The frozen one is the stable
 reference. This one is alive and learning.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves) — a failed restore keeps the files instead of saving over them
+#   What: when _restore_evolved_weights() fails, proto_weights.pt and proto_lenia_state.pt are renamed to
+#         <name>.unloadable-<stamp> (os.replace, no copy) and the failure is an ERROR naming them.
+#   Why:  #1095: after the torn load the proto started fresh and its next periodic save wrote over the old file.
+#         Atomic saves stop the tear; this stops any other restore failure (a load_flow_state validation error, an
+#         interrupted read, a future format change) from turning into silent loss of the evolved state.
+#   How:  only the except path changes; a missing file is still the normal "starting fresh" INFO.
+# [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves; Josh 2026-10-14 "anything that can't risk a failed save, be atomic")
+#   What: save_evolved_weights() writes proto_weights.pt and proto_lenia_state.pt through core.atomic_io.torch_save_atomic
+#         (temp file in ~/.elmer -> torch.save -> fsync -> os.replace -> fsync dir) instead of torch.save in place.
+#   Why:  #1095: a daemon restart caught torch.save of the ~1.4 GB proto_weights.pt mid-write; the torn file could not
+#         load, the proto restarted from the pretrained body and then saved over it (~18 h of F1 + adapter state lost).
+#   How:  same dict, same torch.save bytes, same paths; readers (_restore_evolved_weights, UniAI flow_probe) unchanged.
+#         The two files are each atomic; they are still two files (a kill between them leaves the new body with the
+#         previous Lenia baselines, which _restore tolerates as before).
 # [2026-10-12] Claude Code (Opus 5.5, lane f1-idle-silence; Josh 2026-10-12 "E1 for now") — idle cycles are silence
 #   What: process() opens the engine's capture_context(traffic=<the River delivered input this cycle>). On an idle
 #         cycle (_read_river_delta() returned None, so the encoder emits its idle filler sequence) the forward is
@@ -182,6 +197,7 @@ from core.base_socket import (
 )
 from core.substrate_signal import SubstrateSignal
 from core.instance_paths import instance_file, tracts_root
+from core.atomic_io import torch_save_atomic
 
 logger = logging.getLogger("elmer.proto_brain")
 
@@ -934,7 +950,18 @@ class ProtoUniBrainSocket(ElmerSocket):
 
             return True
         except Exception as exc:
-            logger.warning("ProtoUniBrain: weight restore failed (%s) — starting fresh", exc)
+            # Keep the unloadable files: the next periodic save would otherwise write over them (#1095).
+            _stamp = time.strftime("%Y%m%dT%H%M%S")
+            _kept = []
+            for _p in (_PROTO_WEIGHTS_PATH, _PROTO_LENIA_STATE_PATH):
+                if os.path.exists(_p):
+                    try:
+                        os.replace(_p, f"{_p}.unloadable-{_stamp}")
+                        _kept.append(os.path.basename(_p))
+                    except OSError as _exc:
+                        logger.error("ProtoUniBrain: could not set %s aside (%s)", _p, _exc)
+            logger.error("ProtoUniBrain: weight restore failed (%s) — starting fresh; kept %s as *.unloadable-%s "
+                         "beside them for recovery", exc, ", ".join(_kept) or "nothing", _stamp)
             return False
 
     def save_evolved_weights(self) -> None:
@@ -955,16 +982,17 @@ class ProtoUniBrainSocket(ElmerSocket):
             _flow_state = self._lenia.flow_state_dict() if hasattr(self._lenia, 'flow_state_dict') else None
             if _flow_state is not None:
                 _saved['flow_lenia_f1'] = _flow_state  # F1 mass/usage/graph, atomically with the body
-            _torch.save(_saved, _PROTO_WEIGHTS_PATH)
+            # Atomic (#1095): temp in ~/.elmer + fsync + os.replace, so an interrupted save leaves the previous file
+            torch_save_atomic(_saved, _PROTO_WEIGHTS_PATH, _torch)
 
             # Save Lenia state (baselines for Phase 1 activation-coupled dynamics)
             if self._lenia:
-                _torch.save({
+                torch_save_atomic({
                     'initial_norms': self._lenia._initial_norms,
                     'initial_mean_abs': self._lenia._initial_mean_abs,
                     'step_count': self._lenia.state.step_count,
                     'weight_deltas': {k: v for k, v in self._lenia.state.weight_deltas.items()},
-                }, _PROTO_LENIA_STATE_PATH)
+                }, _PROTO_LENIA_STATE_PATH, _torch)
 
             logger.info("ProtoUniBrain: weights saved (step %d)", self._lenia_steps)
         except Exception as exc:
