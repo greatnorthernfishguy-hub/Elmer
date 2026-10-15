@@ -10,6 +10,10 @@ Training strategy:
   Phase 2: Unfreeze body with 100x smaller LR (optional, careful)
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1108: identity width = graph_io.IDENTITY_DIM (768)
+#   What: synthetic identities are IDENTITY_DIM wide.
+#   Why:  #1108: the encoder takes the identity vector at the embedding model's width (768); nothing pads/truncates.
+#   How:  IDENTITY_DIM from graph_io.
 # [2026-03-20] Claude Code (Opus 4.6) — Initial training implementation
 #   What: Training loop for ElmerBrain I/O layers
 #   Why:  PRD §10 — trained on entity's lived experience
@@ -31,7 +35,7 @@ import torch.nn as nn
 import torch.optim as optim
 from typing import Dict, List, Tuple, Optional
 
-from graph_io import GraphFeatures, SIGNAL_FIELDS, ACTION_TYPES
+from graph_io import GraphFeatures, SIGNAL_FIELDS, ACTION_TYPES, IDENTITY_DIM
 from operate import ElmerBrain, perform_surgery
 
 
@@ -81,7 +85,7 @@ def _base_features(n_nodes=500, n_synapses=300, density=0.02,
     recent_firings = torch.clamp(torch.randn(15) * 5 * health_mult + 10, 0, 100)
     stdp_delta = torch.tensor([np.random.normal(0.001 * health_mult, 0.0005)])
 
-    identity_emb = torch.randn(384) * 0.1
+    identity_emb = torch.randn(IDENTITY_DIM) * 0.1
 
     return GraphFeatures(
         node_voltages=voltages,
@@ -188,7 +192,7 @@ def _scenario_identity_drift():
         clustering=0.35, health_mult=0.9
     )
     # Identity is specifically low
-    features.identity_embedding = torch.randn(384) * 0.5  # noisy identity
+    features.identity_embedding = torch.randn(IDENTITY_DIM) * 0.5  # noisy identity
     targets = {
         'coherence_score': 0.60 + np.random.normal(0, 0.05),
         'health_score': 0.70 + np.random.normal(0, 0.05),

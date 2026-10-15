@@ -11,6 +11,21 @@ These replace the token embedding and vocabulary prediction head that
 were designed for language. The transformer body between them is unchanged.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1108: the identity input is 768-d end to end
+#   What: IDENTITY_DIM = 768 (= ng_embed.EMBEDDING_DIM, the Snowflake model the identity vector comes from);
+#         identity_proj = Linear(IDENTITY_DIM, hidden). forward() takes the identity vector at exactly IDENTITY_DIM
+#         (an empty / absent one = zeros, "no spine", as before) and raises ValueError on any other length — no
+#         pad, no truncate. A checkpoint whose identity_proj is 384 wide (every encoder trained so far:
+#         elmer_brain_v0.1.pt, NeuroGraph tonic_brain.pt) is migrated on load_state_dict by a pre-hook: its 384
+#         trained input columns are kept as columns 0..383 and columns 384..767 start at zero, logged at WARNING.
+#   Why:  #1108 / DIM_GUARD.md §2.2: the CC Tonic feeds the 768-d Snowflake spine vector and _pad_or_truncate cut it
+#         to 384 silently, every tick. Why the migration is exact rather than a re-initialisation: the 384 columns
+#         were trained on proxy features (train_on_syl.py: identity-node voltage/excitability stats padded to 384;
+#         train.py / operate.py: noise), never on an embedding, so they carry no learned meaning for Snowflake dims in
+#         either layout; zero new columns keep today's outputs bit-for-bit (proven in tests/test_identity_768.py)
+#         while the input itself is no longer truncated. Using dims 384..767 needs identity_proj retrained on 768-d
+#         spine vectors (train_tonic.py) — logged at every migration, listed in MEAN_CENTRE.md as open.
+#   How:  IDENTITY_DIM constant; _check_identity(); _migrate_identity_proj (nn.Module load_state_dict pre-hook).
 # [2026-03-20] Claude Code (Opus 4.6) — Initial implementation
 #   What: GraphStateEncoder and GraphSignalDecoder for Elmer model surgery
 #   Why:  PRD §5.4 — harvest reasoning engine, new eyes, new voice
@@ -40,6 +55,12 @@ from typing import Dict, Any, Optional
 
 # How many raw graph features we extract per "token position"
 GRAPH_FEATURE_DIM = 64
+
+# The identity-conditioning vector's width = the active embedding model's dimension (ng_embed.EMBEDDING_DIM,
+# Snowflake/snowflake-arctic-embed-m-v1.5). Pinned to ng_embed by tests/test_identity_768.py. #1108.
+IDENTITY_DIM = 768
+# Width of identity_proj in every encoder trained before #1108 (migrated on load, see _migrate_identity_proj).
+LEGACY_IDENTITY_DIM = 384
 
 
 @dataclass
@@ -108,7 +129,8 @@ class GraphStateEncoder(nn.Module):
         self.node_proj = nn.Linear(32, hidden_dim)       # aggregated node stats (padded/truncated to 32)
         self.synapse_proj = nn.Linear(32, hidden_dim)    # aggregated synapse stats (padded/truncated to 32)
         self.temporal_proj = nn.Linear(16, hidden_dim)   # recent firing window + stdp stats
-        self.identity_proj = nn.Linear(384, hidden_dim)  # identity embedding (384 = ecosystem standard dim)
+        self.identity_proj = nn.Linear(IDENTITY_DIM, hidden_dim)  # identity embedding (#1108: 768, ng_embed's dim)
+        self._register_load_state_dict_pre_hook(self._migrate_identity_proj)
 
         # Extra positions for neighborhood samples
         self.neighborhood_proj = nn.Linear(GRAPH_FEATURE_DIM, hidden_dim)
@@ -118,6 +140,39 @@ class GraphStateEncoder(nn.Module):
 
         # Layer norm to match what the transformer expects post-embedding
         self.layer_norm = nn.LayerNorm(hidden_dim)
+
+    @staticmethod
+    def _migrate_identity_proj(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
+                               error_msgs):
+        """load_state_dict pre-hook (#1108): a 384-wide identity_proj (pre-#1108 checkpoint) becomes IDENTITY_DIM
+        wide — trained columns 0..383 kept, columns 384..767 zero — so the outputs are exactly the old ones."""
+        key = prefix + "identity_proj.weight"
+        w = state_dict.get(key)
+        if w is None or w.dim() != 2 or w.shape[1] == IDENTITY_DIM:
+            return
+        if w.shape[1] != LEGACY_IDENTITY_DIM:
+            return  # anything else: let load_state_dict report the size mismatch
+        new = torch.zeros(w.shape[0], IDENTITY_DIM, dtype=w.dtype, device=w.device)
+        new[:, :LEGACY_IDENTITY_DIM] = w
+        state_dict[key] = new
+        import logging
+        logging.getLogger("elmer.graph_io").warning(
+            "GraphStateEncoder: migrated a %d-wide identity_proj to %d (columns %d..%d zero): the identity vector is "
+            "now taken at full width, but only its first %d dims are weighted until identity_proj is retrained on "
+            "%d-d identity vectors (#1108)", LEGACY_IDENTITY_DIM, IDENTITY_DIM, LEGACY_IDENTITY_DIM,
+            IDENTITY_DIM - 1, LEGACY_IDENTITY_DIM, IDENTITY_DIM)
+
+    @staticmethod
+    def _check_identity(t: torch.Tensor) -> torch.Tensor:
+        """The identity vector at exactly IDENTITY_DIM (empty = zeros); any other length raises (#1108)."""
+        t = t.reshape(-1)
+        if t.numel() == 0:
+            return torch.zeros(IDENTITY_DIM, device=t.device)
+        if t.numel() != IDENTITY_DIM:
+            raise ValueError(
+                f"GraphStateEncoder: identity_embedding is {t.numel()}-d but the encoder takes {IDENTITY_DIM}-d "
+                f"(the active embedding model's dimension); it is not padded or truncated (#1108)")
+        return t
 
     def _pad_or_truncate(self, t: torch.Tensor, target_len: int) -> torch.Tensor:
         """Pad with zeros or truncate to target length."""
@@ -188,10 +243,8 @@ class GraphStateEncoder(nn.Module):
         ]).to(device)
         h_temporal = self.temporal_proj(temporal.unsqueeze(0))
 
-        # Position 4: Identity embedding
-        identity = self._pad_or_truncate(
-            features.identity_embedding, 384
-        ).to(device)
+        # Position 4: Identity embedding (#1108: full width, never padded / truncated)
+        identity = self._check_identity(features.identity_embedding).to(device)
         h_identity = self.identity_proj(identity.unsqueeze(0))
 
         # Stack into sequence: (1, n_positions, hidden_dim)

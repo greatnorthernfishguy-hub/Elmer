@@ -5,6 +5,10 @@ Bridges the NG-Lite data structures (NGLiteNode, NGLiteSynapse) into
 the tensor format that GraphStateEncoder expects.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1108: identity width = graph_io.IDENTITY_DIM (768)
+#   What: an identity vector given or averaged from identity nodes must be IDENTITY_DIM long (ValueError otherwise); the zero default is IDENTITY_DIM; no truncation / padding.
+#   Why:  #1108: the encoder takes the identity vector at the embedding model's width (768); nothing pads/truncates.
+#   How:  IDENTITY_DIM from graph_io.
 # [2026-03-20] Claude Code (Opus 4.6) — Initial implementation
 #   What: Extract real graph state from NG-Lite into GraphFeatures tensors
 #   Why:  Training data pipeline for ElmerBrain I/O layers
@@ -28,7 +32,7 @@ import numpy as np
 import torch
 from typing import Dict, Any, Optional, List, Tuple
 
-from graph_io import GraphFeatures
+from graph_io import GraphFeatures, IDENTITY_DIM
 
 
 def extract_features_from_ng_lite(ng_lite, identity_embedding: Optional[np.ndarray] = None) -> GraphFeatures:
@@ -36,7 +40,7 @@ def extract_features_from_ng_lite(ng_lite, identity_embedding: Optional[np.ndarr
 
     Args:
         ng_lite: An NGLite instance (from the vendored ng_lite.py).
-        identity_embedding: Optional 384-dim identity vector. If None,
+        identity_embedding: Optional IDENTITY_DIM (768) identity vector. If None,
             attempts to compute one from identity-tagged nodes.
 
     Returns:
@@ -180,13 +184,11 @@ def extract_features_from_ng_lite(ng_lite, identity_embedding: Optional[np.ndarr
             id_emb = torch.tensor(avg, dtype=torch.float32)
         else:
             # No identity info available — zero vector
-            id_emb = torch.zeros(384)
+            id_emb = torch.zeros(IDENTITY_DIM)
 
-    # Ensure identity embedding is 384-dim
-    if id_emb.shape[0] > 384:
-        id_emb = id_emb[:384]
-    elif id_emb.shape[0] < 384:
-        id_emb = torch.cat([id_emb, torch.zeros(384 - id_emb.shape[0])])
+    # The identity vector is taken at the embedding model's width; never truncated or padded (#1108)
+    if id_emb.shape[0] != IDENTITY_DIM:
+        raise ValueError(f"identity embedding is {id_emb.shape[0]}-d; the encoder takes {IDENTITY_DIM}-d (#1108)")
 
     return GraphFeatures(
         node_voltages=node_voltages,
