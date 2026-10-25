@@ -23,6 +23,46 @@ Dual-pass (Punchlist #81 — Josh's invention):
   tree links form naturally through similarity association.
 
 # ---- Changelog ----
+# [2026-10-23] Claude Code (Opus 5.5, laptop; #920 / #922, Josh "go ahead" 2026-10-23; P503: trying is allowed, NO re-vendor)
+#   What: (1) NEW NGEmbed.prepare_dual_record(content): the pure COMPUTE half of dual_record_outcome (TID concept
+#         extraction + the tree embeddings), writes nothing, takes no lock. (2) dual_record_outcome(..., prepared=)
+#         keyword-only: with a prepare_dual_record() result it skips the extraction and the tree embedding and only
+#         WRITES; prepared=None (default) is the old single call, unchanged. (3) _tid_extract_window remembers the
+#         exception CLASS of the last failed TID call (self._last_failure_class; stats["dual_pass"]["last_failure_class"])
+#         and the rate-limited R3 WARNING names it (class name only, never str(exc)).
+#   Why:  #920/P497(4): the slow TID call ran under the CC daemon's _concurrent_lock (one call per 2000-char window,
+#         up to tid_timeout=30 s each), so a slow TID made hooks and the Tonic wait. Compute outside, commit inside.
+#         And the poison-turn diagnosis (2026-10-23) found the failing calls invisible: requests gives up at
+#         tid_timeout, uvicorn then drops TID's access line for the disconnected client, and the class was only at debug.
+#   How:  R3 is unchanged: a None extraction still raises DualPassIncompleteError before ANY write, on both paths.
+#         Canonical change on the NG review branch cc-laptop-poison-920-20261023 only; NOT re-vendored anywhere.
+# [2026-10-15] Claude Code (Opus 5.5, Executive; Josh "#1115 is good") — #1115: embeddings are batch-invariant
+#   What: _onnx_embed_ids_batch runs each sequence through the ONNX session on its own (shape [1, len]).
+#   Why:  the int8 dynamically-quantized model computes activation scales over the whole batch tensor, so the
+#         same text came out at 0.977-0.992 cosine depending on its batch-mates and their padding. "Same text ->
+#         same vector -> same node" did not hold across batches (Commons, dual-pass trees, windows, hash nodes).
+#   How:  per-sequence session.run with the batch padding stripped (masked pad positions still widen the
+#         quantizer's range); results equal the existing single-text path, so stored vectors, the
+#         mean-centring vector and the thresholds stay valid. ~1.3x slower per batch on the laptop CPU.
+# [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1107: the model's fixed mean-centring vector
+# What: CENTRE_VERSION / CENTRE_SHA256 and embedding_centre(): a 768-d float32 vector shipped inside this file (base64,
+#   sha256-checked on first use, returned read-only). It is the mean of 18,675 L2-normalised document-mode Snowflake
+#   vectors (the CC vector store, 2026-10-14 copy: 3,026 whole deposits + 15,649 dual-pass concepts = the mix NG-Lite's
+#   dual-pass receives); |mu| = 0.802. Reproduce / verify with compute_embedding_centre.py (NG-only tool).
+# Why: Josh 2026-10-14 "Mean center" (punch list #1107). Snowflake vectors share a common direction: two unrelated
+#   texts sit at ~0.69 cosine, so a raw-cosine threshold cannot separate related from unrelated. NG-Lite subtracts this
+#   vector (and re-normalises) before every similarity comparison. It is a CONSTANT, versioned with the model: never
+#   recomputed at runtime (a drifting centre would silently change every similarity in every module). A new model or a
+#   new centre = a new CENTRE_VERSION, and NG-Lite states record the version they were calibrated under.
+# How: Constants after MODEL_NAME / EMBEDDING_DIM; embedding_centre() decodes once and caches. No other behaviour change.
+# [2026-10-14] Claude Code (Opus 5.5, lane dim-guard) — #1097: public MODEL_NAME / EMBEDDING_DIM
+# What: Module constants MODEL_NAME and EMBEDDING_DIM, read from _DEFAULT_CONFIG (no behaviour change).
+# Why: The active model's identity and dimension had no public name. cc_topology_export/merge look up
+#   ng_embed.MODEL_NAME, which did not exist, so both sides read "unknown" and the cross-machine model check
+#   never fired; NG-Lite and the vector store need the dimension to fail loud on wrong-dim vectors
+#   (tests/test_dim_guard.py pins ng_lite.DEFAULT_CONFIG["embedding_dim"] to EMBEDDING_DIM).
+# How: Two assignments after _DEFAULT_CONFIG.
+# -------------------
 # [2026-09-26] openrouter/deepseek/deepseek-v4.1-flash (OpenCode harness on T3 Code),
 #   lane z2-ngembed-cap-roundrobin-20260926 — #666.
 # What: _extract_concepts now builds its concept union by round-robin interleave
@@ -239,6 +279,80 @@ _DEFAULT_CONFIG = {
     "tid_max_tokens": 500,
 }
 
+# The active embedding model and its output dimension — the single source of truth for every consumer that stores
+# or compares vectors (#1097). A vector of any other dimension came from another model.
+MODEL_NAME: str = _DEFAULT_CONFIG["model_id"]
+EMBEDDING_DIM: int = int(_DEFAULT_CONFIG["embedding_dim"])
+
+# The model's fixed mean-centring vector (#1107): the mean of L2-normalised document-mode vectors of this model over a
+# reference corpus, subtracted (then re-normalised) by NG-Lite before every cosine comparison, because this model's
+# vectors share a common direction (unrelated texts at ~0.69 raw cosine). Versioned with the model and NEVER recomputed
+# at runtime. Provenance: CC vector store copy 2026-10-14 (sha256 90e3ccb4...), 18,675 vectors (3,026 whole deposits +
+# 15,649 dual-pass concepts), float64 accumulation in sorted-key order, cast to float32; |mu| = 0.8023.
+# compute_embedding_centre.py (NeuroGraph repo) reproduces it bit for bit.
+CENTRE_VERSION: str = "snowflake-arctic-embed-m-v1.5/cc-store-20261014/v1"
+CENTRE_SHA256: str = "99f0e568b670e1591e40f1a7a9d518dc42dcc6b342fbf2ec6e269964c9824518"
+_CENTRE_B64 = (
+    "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"
+)
+_centre: Optional[np.ndarray] = None
+
+
+def embedding_centre() -> np.ndarray:
+    """The model's mean-centring vector (EMBEDDING_DIM float32, read-only). Raises if the shipped bytes are damaged."""
+    global _centre
+    if _centre is None:
+        import base64
+        import hashlib
+
+        raw = base64.b64decode("".join(_CENTRE_B64))
+        if hashlib.sha256(raw).hexdigest() != CENTRE_SHA256 or len(raw) != 4 * EMBEDDING_DIM:
+            raise RuntimeError(f"ng_embed: the shipped centre {CENTRE_VERSION} is damaged (sha256 mismatch)")
+        c = np.frombuffer(raw, dtype="<f4").astype(np.float32)
+        c.setflags(write=False)
+        _centre = c
+    return _centre
+
 # Concept extraction prompt — not classification, not labeling.
 # The LLM reads content and identifies distinct concepts within it.
 # This is extraction at the ingestion boundary — the LLM is a tool
@@ -314,6 +428,7 @@ class NGEmbed:
         # stays the cumulative truth.
         self._last_extract_warn = 0.0
         self._failures_at_last_warn = 0
+        self._last_failure_class = None   # [2026-10-23] #920: class name of the last failed TID call
 
     # -- Singleton -----------------------------------------------------------
 
@@ -706,26 +821,28 @@ class NGEmbed:
                 raise EmbeddingUnavailableError(
                     "embedding window exceeds 512 tokens"
                 )
-        max_len = max(len(ids) for ids in ids_list)
-        input_ids = np.zeros((len(ids_list), max_len), dtype=np.int64)
-        attention_mask = np.zeros((len(ids_list), max_len), dtype=np.int64)
-        for i, ids in enumerate(ids_list):
-            length = len(ids)
-            input_ids[i, :length] = ids
-            attn = attention_list[i]
-            attention_mask[i, :length] = attn[:length]
-
-        outputs = self._session.run(
-            None,
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-            },
-        )
-
+        # #1115: one sequence per session.run. The shipped model is dynamically int8-quantized
+        # (onnx/model_quantized.onnx): activation scales are computed over the WHOLE input tensor, so
+        # other texts and their padding in the same batch changed this text's vector (measured 0.977-0.992
+        # cosine to its single-text vector). Running each sequence alone makes every result equal the
+        # single-text embedding (same model, same vector space, same centre); cost ~1.3x on the laptop CPU.
         results = []
-        for i in range(len(ids_list)):
-            vec = outputs[1][i, :].astype(np.float32)
+        for i, ids in enumerate(ids_list):
+            attn = list(attention_list[i][:len(ids)])
+            # Strip the tokenizer's batch padding too: padded positions (attention 0) still enter the
+            # quantizer's activation range even when masked, so a text padded to a longer batch-mate's
+            # length would not equal its own single-text embedding.
+            length = len(attn)
+            while length > 0 and attn[length - 1] == 0:
+                length -= 1
+            outputs = self._session.run(
+                None,
+                {
+                    "input_ids": np.asarray([ids[:length]], dtype=np.int64),
+                    "attention_mask": np.asarray([attn[:length]], dtype=np.int64),
+                },
+            )
+            vec = outputs[1][0, :].astype(np.float32)
             if normalize:
                 norm = np.linalg.norm(vec)
                 if norm > 0:
@@ -961,6 +1078,7 @@ class NGEmbed:
         metadata: Optional[Dict[str, Any]] = None,
         *,
         windows: Optional[Sequence[EmbedWindow]] = None,
+        prepared: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Dual-pass learning: forest embedding + tree concept extraction.
 
@@ -980,6 +1098,13 @@ class NGEmbed:
             metadata: Additional metadata dict.
             windows: Optional precomputed EmbedWindow sequence. Echoed
                 into result["windows"] when non-empty; not deposited here.
+            prepared: Optional result of prepare_dual_record(content) for
+                THIS content (2026-10-23, #920/#922): the extraction and
+                the tree embeddings were computed earlier (outside the
+                caller's lock); this call only writes. A prepared
+                extraction failure (concepts None) takes the SAME R3 path:
+                WARNING + signal_error + DualPassIncompleteError, no write.
+                None (default) = extract and embed here, as before.
 
         Returns:
             {
@@ -992,7 +1117,10 @@ class NGEmbed:
         """
         # Extract before any write. None = TID broke (raise, no deposit).
         # [] = completed dual-pass with zero trees (write forest).
-        concepts = self._extract_concepts(content)
+        if prepared is not None:
+            concepts = prepared.get("concepts")
+        else:
+            concepts = self._extract_concepts(content)
         if concepts is None:
             # Warn + signal RATE-LIMITED (see _extraction_warn_due): when
             # TID is permanently absent every deposit fails, so per-deposit
@@ -1002,8 +1130,9 @@ class NGEmbed:
                 logger.warning(
                     "dual_record_outcome[%s]: concept extraction FAILED — no deposit "
                     "(R3 atomicity); cumulative TID extraction failures=%d "
-                    "(+%d since last warn — TID absent/unreachable)",
+                    "(+%d since last warn — TID absent/unreachable); last_failure=%s",
                     target_id, self._failures, _since,
+                    (prepared or {}).get("failure_class") or getattr(self, "_last_failure_class", None) or "-",
                 )
                 _signal = getattr(ecosystem, "signal_error", None)
                 if callable(_signal):
@@ -1020,7 +1149,15 @@ class NGEmbed:
             )
 
         # Embed trees before any write so embed failure leaves no forest.
-        tree_embeddings = self.embed_batch(concepts) if concepts else []
+        if prepared is not None:
+            tree_embeddings = list(prepared.get("tree_embeddings") or [])
+            if len(tree_embeddings) != len(concepts):
+                raise DualPassIncompleteError(
+                    f"prepared dual pass for {target_id} has {len(tree_embeddings)} tree embeddings "
+                    f"for {len(concepts)} concepts; no deposit"
+                )
+        else:
+            tree_embeddings = self.embed_batch(concepts) if concepts else []
 
         # Workstream 2 (#274, 2026-05-31): use record_outcome_broadcast when
         # the ecosystem supports it; fall back to record_outcome for
@@ -1087,6 +1224,29 @@ class NGEmbed:
         )
 
         return result
+
+    def prepare_dual_record(self, content: str) -> Dict[str, Any]:
+        """The pure COMPUTE half of dual_record_outcome (2026-10-23, #920/#922).
+
+        Runs the TID concept extraction and embeds the concepts, and nothing
+        else: no ecosystem, no write, no lock. Pass the result to
+        dual_record_outcome(..., prepared=) for the SAME content to write.
+
+        Returns {"concepts": [str] | None, "tree_embeddings": [np.ndarray],
+        "failure_class": str | None}. concepts None = the extraction FAILED
+        (failure_class = the exception class of the failed TID call, e.g.
+        "ReadTimeout", or "extraction_failed"); dual_record_outcome then
+        raises DualPassIncompleteError without writing (R3). An embedding
+        failure raises here (EmbeddingUnavailableError), as it would have
+        inside dual_record_outcome, before any write.
+        """
+        self._last_failure_class = None
+        concepts = self._extract_concepts(content)
+        if concepts is None:
+            return {"concepts": None, "tree_embeddings": [],
+                    "failure_class": self._last_failure_class or "extraction_failed"}
+        tree_embeddings = self.embed_batch(concepts) if concepts else []
+        return {"concepts": concepts, "tree_embeddings": list(tree_embeddings), "failure_class": None}
 
     def _create_substrate_link(
         self,
@@ -1178,6 +1338,7 @@ class NGEmbed:
             # caller (dual_record_outcome) so a permanently-absent TID doesn't flood
             # the log; the per-call exception detail stays at debug.
             self._failures += 1
+            self._last_failure_class = type(exc).__name__
             logger.debug("Concept extraction failed (TID): %s", exc)
             return None
 
@@ -1270,6 +1431,7 @@ class NGEmbed:
                 "extractions": self._extractions,
                 "concepts_total": self._concepts_total,
                 "failures": self._failures,
+                "last_failure_class": getattr(self, "_last_failure_class", None),
                 "avg_concepts": (
                     round(self._concepts_total / self._extractions, 1)
                     if self._extractions > 0 else 0
